@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Next.js × Supabase Starter",
-  description: "Auth / DB / Storage CRUD demo",
+  title: "みんなで動かすバス停ロボット",
+  description: "地域の声で移動するバス停ロボットの展示デモ",
 };
 
 export default function RootLayout({
