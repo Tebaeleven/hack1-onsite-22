@@ -107,16 +107,6 @@ const statusLabel: Record<RobotStatus, string> = {
   guiding: "案内中",
 };
 
-const scenarioDisplay: Record<
-  ScenarioId,
-  { label: string; icon: string; color: string }
-> = {
-  medical: { label: "通院支援", icon: "🏥", color: "#fb7185" },
-  shopping: { label: "買い物", icon: "🛒", color: "#f59e0b" },
-  student: { label: "学生イベント", icon: "🎓", color: "#a855f7" },
-  business: { label: "企業説明会", icon: "🏢", color: "#06b6d4" },
-};
-
 const bottomTabs: Array<{
   id: AppTab;
   label: string;
@@ -165,13 +155,6 @@ const userPresets: UserPreset[] = [
 const userPresetById = Object.fromEntries(
   userPresets.map((preset) => [preset.id, preset])
 ) as Record<UserPresetId, UserPreset>;
-
-function scenarioIdForLocation(locationId: string): ScenarioId {
-  if (locationId === "market" || locationId === "supermarket") return "shopping";
-  if (locationId === "school") return "student";
-  if (locationId === "company") return "business";
-  return "medical";
-}
 
 function optionOrFirst(options: string[], preferred: string) {
   return options.includes(preferred) ? preferred : options[0] ?? "";
@@ -728,19 +711,42 @@ function EventDetailsDialog({
   );
 }
 
+const requesterLabelByScenario: Record<ScenarioId, string> = {
+  medical: "高齢者",
+  shopping: "一般人",
+  student: "学生",
+  business: "企業",
+};
+
+const requestFilters = [
+  { id: "all", label: "すべて" },
+  { id: "citizen", label: "高齢者・一般人" },
+  { id: "business", label: "企業" },
+] as const;
+
+type RequestFilterId = (typeof requestFilters)[number]["id"];
+
 function RequestsTab({
-  scenarioRequests,
-  scenarioId,
+  requests,
   onReaction,
-  onCommand,
   onReset,
 }: {
-  scenarioRequests: MoveRequest[];
-  scenarioId: ScenarioId;
+  requests: MoveRequest[];
   onReaction: (requestId: string, reaction: ReactionKey) => void;
-  onCommand: (request: MoveRequest) => void;
   onReset: () => void;
 }) {
+  const [filter, setFilter] = useState<RequestFilterId>("all");
+  const filteredRequests =
+    filter === "all"
+      ? requests
+      : filter === "citizen"
+        ? requests.filter((request) => request.requestType === "citizen")
+        : requests.filter((request) => request.requestType === "business");
+  const sortedRequests = [...filteredRequests].sort(
+    (a, b) =>
+      Number(b.status === "adopted") - Number(a.status === "adopted")
+  );
+
   return (
     <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
       <div className="flex items-center justify-between gap-3">
@@ -759,17 +765,40 @@ function RequestsTab({
         </Button>
       </div>
       <p className="mt-2 text-sm font-bold text-[#53635a]">
-        {scenarioDisplay[scenarioId].label}に関する申請です。応援が集まると指令にできます。
+        応援が{REQUEST_SUPPORT_THRESHOLD}
+        件集まると、自動でバス停ロボットに指令が出ます。
       </p>
+      <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+        {requestFilters.map((option) => {
+          const active = filter === option.id;
+          return (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => setFilter(option.id)}
+              className={`h-10 shrink-0 rounded-full border-2 px-4 text-sm font-black ${
+                active
+                  ? "border-[#313131] bg-[#58cc02] text-white"
+                  : "border-[#d8e0dc] bg-white text-[#53635a]"
+              }`}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
       <div className="mt-4 flex flex-col gap-3">
-        {scenarioRequests.map((request) => (
-          <RequestCard
-            key={request.id}
-            request={request}
-            onReaction={(reaction) => onReaction(request.id, reaction)}
-            onCommand={() => onCommand(request)}
-          />
-        ))}
+        {sortedRequests.length > 0 ? (
+          sortedRequests.map((request) => (
+            <RequestCard
+              key={request.id}
+              request={request}
+              onReaction={(reaction) => onReaction(request.id, reaction)}
+            />
+          ))
+        ) : (
+          <EmptyPanel text="該当する申請はありません。" />
+        )}
       </div>
     </section>
   );
@@ -1238,17 +1267,22 @@ function RouteRow({ label, value }: { label: string; value: string }) {
 function RequestCard({
   request,
   onReaction,
-  onCommand,
 }: {
   request: MoveRequest;
   onReaction: (reaction: ReactionKey) => void;
-  onCommand: () => void;
 }) {
   const destination = getLocation(request.destinationId);
-  const total =
-    request.reactions.wantToGo +
-    request.reactions.helpful +
-    request.reactions.cheer;
+  const total = getRequestSupportTotal(request);
+  const reached = total >= REQUEST_SUPPORT_THRESHOLD;
+  const ratio = Math.min(
+    100,
+    Math.round((total / REQUEST_SUPPORT_THRESHOLD) * 100)
+  );
+  const remaining = Math.max(0, REQUEST_SUPPORT_THRESHOLD - total);
+  const requesterLabel =
+    request.requestType === "business"
+      ? "企業"
+      : requesterLabelByScenario[request.scenarioId];
 
   return (
     <article className="rounded-[1.25rem] border-[3px] border-[#313131] bg-[#f9fbf7] p-3">
@@ -1263,6 +1297,9 @@ function RequestCard({
               }
             >
               {request.status === "adopted" ? "採択中" : "候補"}
+            </Badge>
+            <Badge className="rounded-full bg-[#ff9600] text-white">
+              {requesterLabel}
             </Badge>
             <span className="text-xs font-black text-[#53635a]">
               {destination.shortName} / {request.desiredTime}
@@ -1284,7 +1321,8 @@ function RequestCard({
             key={reaction}
             type="button"
             onClick={() => onReaction(reaction)}
-            className="min-h-13 rounded-2xl bg-white px-2 text-xs font-black transition active:scale-95"
+            disabled={reached}
+            className="min-h-13 rounded-2xl bg-white px-2 text-xs font-black transition active:scale-95 disabled:opacity-60"
           >
             {reactionLabels[reaction]}
             <span className="block text-base text-[#58cc02]">
@@ -1294,18 +1332,23 @@ function RequestCard({
         ))}
       </div>
 
-      <div className="mt-3 flex items-center justify-between gap-3">
-        <span className="text-sm font-black text-[#53635a]">
-          合計 {total} 応援
-        </span>
-        <Button
-          type="button"
-          onClick={onCommand}
-          className="h-11 rounded-2xl bg-[#ff9600] px-4 font-black text-white shadow-[0_4px_0_#b86b00] hover:bg-[#f08b00]"
-        >
-          <SparklesIcon data-icon="inline-start" />
-          指令
-        </Button>
+      <div className="mt-3 flex flex-col gap-1">
+        <div className="flex items-center justify-between text-xs font-black text-[#53635a]">
+          <span>応援</span>
+          <span>
+            {Math.min(total, REQUEST_SUPPORT_THRESHOLD)} /{" "}
+            {REQUEST_SUPPORT_THRESHOLD}件
+          </span>
+        </div>
+        <Progress
+          value={ratio}
+          className="h-2 bg-[#f0f4ef] [&>[data-slot=progress-indicator]]:bg-[#58cc02]"
+        />
+        <p className="text-xs font-bold text-[#53635a]">
+          {reached
+            ? "応援が目標に到達し、ロボットへ指令が出ました。"
+            : `あと${remaining}件の応援で指令が出ます。`}
+        </p>
       </div>
     </article>
   );
