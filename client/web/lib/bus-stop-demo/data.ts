@@ -569,7 +569,7 @@ export function createSeedRequests(): MoveRequest[] {
   }));
 }
 
-export const REQUEST_SUPPORT_THRESHOLD = 60;
+export const REQUEST_SUPPORT_THRESHOLD = 10;
 
 export function createInitialDemoState(
   scenarioId: ScenarioId = "medical",

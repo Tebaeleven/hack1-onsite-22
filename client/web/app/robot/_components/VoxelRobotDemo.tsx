@@ -41,9 +41,6 @@ type ThreeRefs = {
   targetMarker: THREE.Group;
   routeLine: THREE.Line;
   route: THREE.Vector3[];
-  routeIndex: number;
-  target: THREE.Vector3;
-  isMoving: boolean;
   frameId: number;
   disposed: boolean;
 };
@@ -55,12 +52,18 @@ const statusLabel = {
   guiding: "案内中",
 };
 
+// 1 タイル進むのに要する時間。command.createdAt からの経過時間で位置を決定的に算出する
+const TILE_DURATION_MS = 600;
+
 export function VoxelRobotDemo() {
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const refs = useRef<ThreeRefs | null>(null);
   const arrivalCommandRef = useRef<string | null>(null);
   const { state, updateState } = useSyncedDemoState();
   const [currentMap, setCurrentMap] = useState<MapDefinition>(defaultMapDefinition);
+  // 最新 state を animate ループ (frame closure) から参照するための ref
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   // activeMapId が変わったらリモートからマップを取得
   useEffect(() => {
@@ -159,9 +162,6 @@ export function VoxelRobotDemo() {
       targetMarker,
       routeLine,
       route: initialRoute,
-      routeIndex: 0,
-      target: targetMarker.position.clone(),
-      isMoving: false,
       frameId: 0,
       disposed: false,
     };
@@ -178,20 +178,30 @@ export function VoxelRobotDemo() {
       const active = refs.current;
       if (!active || active.disposed) return;
 
-      const distance = active.robot.position.distanceTo(active.target);
-      if (active.isMoving && distance > 0.04) {
-        active.robot.position.lerp(active.target, 0.045);
-        const direction = active.target.clone().sub(active.robot.position);
-        active.robot.rotation.y = Math.atan2(direction.x, direction.z);
+      const cmd = stateRef.current.activeCommand;
+      const status = stateRef.current.robotStatus;
+      const route = active.route;
+
+      // moving 中は command.createdAt + 経過時間 + ルート長から決定的に位置を算出する。
+      // 全クライアントが同じ計算をするので、別端末でも同じマス目に揃う。
+      if (cmd && status === "moving" && route.length >= 2) {
+        const startTime = new Date(cmd.createdAt).getTime();
+        const totalMs = (route.length - 1) * TILE_DURATION_MS;
+        const elapsedMs = Date.now() - startTime;
+        const progress = Math.max(0, Math.min(elapsedMs / totalMs, 1));
+        const seg = progress * (route.length - 1);
+        const idx = Math.min(Math.floor(seg), route.length - 2);
+        const t = seg - idx;
+        const a = route[idx];
+        const b = route[idx + 1];
+        active.robot.position.copy(a).lerp(b, t);
+        const dir = b.clone().sub(a);
+        if (dir.lengthSq() > 0.0001) {
+          active.robot.rotation.y = Math.atan2(dir.x, dir.z);
+        }
         active.wheels.forEach((wheel) => {
           wheel.rotation.x -= 0.18;
         });
-      } else if (
-        active.isMoving &&
-        active.routeIndex < active.route.length - 1
-      ) {
-        active.routeIndex += 1;
-        active.target.copy(active.route[active.routeIndex]);
       }
 
       active.targetMarker.rotation.y += 0.02;
@@ -232,19 +242,14 @@ export function VoxelRobotDemo() {
     const target = routePoints[routePoints.length - 1];
 
     active.route = routePoints;
-    active.routeIndex =
-      command && state.robotStatus === "moving"
-        ? Math.min(1, routePoints.length - 1)
-        : 0;
-    active.isMoving = Boolean(command && state.robotStatus === "moving");
 
     if (!command) {
       active.robot.position.copy(start);
     } else if (state.robotStatus !== "moving") {
       active.robot.position.copy(target);
     }
+    // moving 中は animate ループが時間ベースで位置を決めるので、ここでは触らない
 
-    active.target.copy(routePoints[active.routeIndex] ?? target);
     active.targetMarker.position.copy(target);
     updateRouteLine(active.routeLine, routePoints);
 
@@ -254,30 +259,26 @@ export function VoxelRobotDemo() {
   }, [command, state.currentLocationId, state.selectedDestinationId, state.robotStatus, currentMap]);
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      const active = refs.current;
-      const currentCommand = state.activeCommand;
-      if (!active || !currentCommand || state.robotStatus !== "moving") return;
+    if (!command || state.robotStatus !== "moving") return;
+    if (arrivalCommandRef.current === command.id) return;
+    const active = refs.current;
+    if (!active || active.route.length < 2) return;
 
-      const distance = active.robot.position.distanceTo(active.target);
-      const isFinalWaypoint = active.routeIndex >= active.route.length - 1;
-      if (
-        !isFinalWaypoint ||
-        distance > 0.12 ||
-        arrivalCommandRef.current === currentCommand.id
-      ) {
-        return;
-      }
+    const startTime = new Date(command.createdAt).getTime();
+    const totalMs = (active.route.length - 1) * TILE_DURATION_MS;
+    const remaining = Math.max(50, startTime + totalMs - Date.now());
 
-      arrivalCommandRef.current = currentCommand.id;
+    const arriveTimer = window.setTimeout(() => {
+      if (arrivalCommandRef.current === command.id) return;
+      arrivalCommandRef.current = command.id;
       updateState((current) => updateRobotStatus(current, "arrived"));
       window.setTimeout(() => {
         updateState((current) => updateRobotStatus(current, "guiding"));
       }, 1400);
-    }, 250);
+    }, remaining);
 
-    return () => window.clearInterval(intervalId);
-  }, [state.activeCommand, state.robotStatus, updateState]);
+    return () => window.clearTimeout(arriveTimer);
+  }, [command, state.robotStatus, updateState]);
 
   return (
     <main className="min-h-screen bg-[#dff8f2] p-3 text-[#25302b] sm:p-5">
@@ -490,7 +491,7 @@ function createGroundTile(kind: TileKind, x: number, z: number) {
 function createBuilding(
   label: string,
   color: string,
-  kind: TileKind,
+  kind: TileKind | string,
   height: number
 ) {
   const group = new THREE.Group();

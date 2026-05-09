@@ -18,6 +18,7 @@ import {
   SearchIcon,
   ShieldIcon,
   SparklesIcon,
+  Trash2Icon,
   UserIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -57,6 +58,7 @@ import {
   addRequest,
   getRequestSupportTotal,
   issueCommand,
+  removeRequest,
   resetDemoState,
   selectDestination,
   switchScenario,
@@ -74,6 +76,7 @@ import type {
 } from "@/lib/bus-stop-demo/types";
 import { useSyncedDemoState } from "@/lib/bus-stop-demo/use-synced-demo-state";
 import { getDefaultMap, listMaps } from "@/lib/maps/queries";
+import { useTileKinds } from "@/lib/tiles/use-tile-kinds";
 import { cn } from "@/lib/utils";
 import { MapManager } from "./MapManager";
 
@@ -95,12 +98,6 @@ type UserPreset = {
   defaultReason: string;
   defaultAudience: string;
   defaultNote: string;
-};
-
-const reactionLabels: Record<ReactionKey, string> = {
-  wantToGo: "行きたい",
-  helpful: "助かる",
-  cheer: "応援",
 };
 
 const statusLabel: Record<RobotStatus, string> = {
@@ -207,6 +204,7 @@ export function BusStopRobotApp() {
   const { maps, currentMap, refresh: refreshMaps } = useMapDefinitions(
     state.activeMapId
   );
+  const { tileKinds, refresh: refreshTileKinds } = useTileKinds();
   const [activeTab, setActiveTab] = useState<AppTab>("map");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [profileSetupOpen, setProfileSetupOpen] = useState(true);
@@ -287,6 +285,19 @@ export function BusStopRobotApp() {
       });
       setActiveTab("impact");
     }
+  };
+
+  const handleRemoveRequest = (requestId: string) => {
+    const target = state.requests.find((item) => item.id === requestId);
+    const confirmed =
+      typeof window !== "undefined"
+        ? window.confirm(
+            `この申請を削除しますか？\n${target?.title ?? ""}`.trim()
+          )
+        : true;
+    if (!confirmed) return;
+    updateState((current) => removeRequest(current, requestId));
+    toast.success("申請を削除しました");
   };
 
   const handleActivateMap = (mapId: string) => {
@@ -415,6 +426,8 @@ export function BusStopRobotApp() {
             onReset={() =>
               updateState(resetDemoState(state.scenarioId, state.activeMapId))
             }
+            isAdmin={userPresetId === "admin"}
+            onRemove={handleRemoveRequest}
           />
         ) : null}
 
@@ -442,6 +455,8 @@ export function BusStopRobotApp() {
             activeMapId={state.activeMapId ?? currentMap.id}
             onActivate={handleActivateMap}
             onChanged={refreshMaps}
+            tileKinds={tileKinds}
+            onTileKindsChanged={refreshTileKinds}
           />
         ) : null}
       </div>
@@ -819,32 +834,51 @@ const requestFilters = [
   { id: "all", label: "すべて" },
   { id: "citizen", label: "高齢者・一般人" },
   { id: "business", label: "企業" },
+  { id: "adopted", label: "達成済み" },
 ] as const;
 
 type RequestFilterId = (typeof requestFilters)[number]["id"];
+
+function isRequestAchieved(request: MoveRequest) {
+  return (
+    request.status === "adopted" ||
+    getRequestSupportTotal(request) >= REQUEST_SUPPORT_THRESHOLD
+  );
+}
 
 function RequestsTab({
   requests,
   map,
   onReaction,
   onReset,
+  isAdmin,
+  onRemove,
 }: {
   requests: MoveRequest[];
   map: MapDefinition;
   onReaction: (requestId: string, reaction: ReactionKey) => void;
   onReset: () => void;
+  isAdmin: boolean;
+  onRemove: (requestId: string) => void;
 }) {
   const [filter, setFilter] = useState<RequestFilterId>("all");
-  const filteredRequests =
-    filter === "all"
-      ? requests
-      : filter === "citizen"
-        ? requests.filter((request) => request.requestType === "citizen")
-        : requests.filter((request) => request.requestType === "business");
-  const sortedRequests = [...filteredRequests].sort(
-    (a, b) =>
-      Number(b.status === "adopted") - Number(a.status === "adopted")
-  );
+  const [detailsRequestId, setDetailsRequestId] = useState<string | null>(null);
+  const adoptedCount = requests.filter(isRequestAchieved).length;
+  const filteredRequests = (() => {
+    if (filter === "adopted") {
+      return requests.filter(isRequestAchieved);
+    }
+    const ongoing = requests.filter((request) => !isRequestAchieved(request));
+    if (filter === "citizen") {
+      return ongoing.filter((request) => request.requestType === "citizen");
+    }
+    if (filter === "business") {
+      return ongoing.filter((request) => request.requestType === "business");
+    }
+    return ongoing;
+  })();
+  const detailsRequest =
+    requests.find((request) => request.id === detailsRequestId) ?? null;
 
   return (
     <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
@@ -870,6 +904,10 @@ function RequestsTab({
       <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
         {requestFilters.map((option) => {
           const active = filter === option.id;
+          const label =
+            option.id === "adopted"
+              ? `${option.label} (${adoptedCount})`
+              : option.label;
           return (
             <button
               key={option.id}
@@ -881,25 +919,35 @@ function RequestsTab({
                   : "border-[#d8e0dc] bg-white text-[#53635a]"
               }`}
             >
-              {option.label}
+              {label}
             </button>
           );
         })}
       </div>
       <div className="mt-4 flex flex-col gap-3">
-        {sortedRequests.length > 0 ? (
-          sortedRequests.map((request) => (
+        {filteredRequests.length > 0 ? (
+          filteredRequests.map((request) => (
             <RequestCard
               key={request.id}
               request={request}
               map={map}
               onReaction={(reaction) => onReaction(request.id, reaction)}
+              onShowDetails={() => setDetailsRequestId(request.id)}
+              isAdmin={isAdmin}
+              onRemove={() => onRemove(request.id)}
             />
           ))
         ) : (
           <EmptyPanel text="該当する申請はありません。" />
         )}
       </div>
+      <RequestDetailsDialog
+        request={detailsRequest}
+        map={map}
+        onOpenChange={(open) => {
+          if (!open) setDetailsRequestId(null);
+        }}
+      />
     </section>
   );
 }
@@ -1373,18 +1421,137 @@ function RouteRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function RequestDetailsDialog({
+  request,
+  map,
+  onOpenChange,
+}: {
+  request: MoveRequest | null;
+  map: MapDefinition;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const open = request !== null;
+  if (!request) {
+    return <Dialog open={open} onOpenChange={onOpenChange} />;
+  }
+
+  const destination = getLocation(request.destinationId, map);
+  const requesterLabel =
+    request.requestType === "business"
+      ? "企業"
+      : requesterLabelByScenario[request.scenarioId];
+  const achieved = isRequestAchieved(request);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[92vh] overflow-y-auto rounded-[2rem] border-4 border-[#313131] p-5 shadow-[0_8px_0_#313131] sm:max-w-md">
+        <DialogHeader>
+          <div className="flex items-center gap-3">
+            <span
+              className="grid size-12 shrink-0 place-items-center rounded-2xl text-2xl text-white"
+              style={{ backgroundColor: destination.color }}
+            >
+              {destination.icon}
+            </span>
+            <Badge className="rounded-full bg-[#ff9600] text-white">
+              {requesterLabel}
+            </Badge>
+            <Badge
+              className={
+                achieved
+                  ? "bg-[#58cc02] text-white"
+                  : "bg-[#1cb0f6] text-white"
+              }
+            >
+              {achieved ? "採択中" : "候補"}
+            </Badge>
+          </div>
+          <DialogTitle className="text-2xl font-black">
+            {request.title}
+          </DialogTitle>
+          <DialogDescription className="text-base font-bold">
+            {request.note}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-2">
+          <RouteRow label="目的地" value={destination.shortName} />
+          <RouteRow label="希望日時" value={request.desiredTime} />
+          <RouteRow label="申請理由" value={request.reason} />
+          <RouteRow label="対象者" value={request.audience} />
+        </div>
+
+        {request.impact.length > 0 && (
+          <section className="rounded-[1.25rem] border-[3px] border-[#313131] bg-[#fff8d8] p-3">
+            <Badge className="rounded-full bg-[#ff9600] text-white">
+              想定インパクト
+            </Badge>
+            <ul className="mt-2 flex flex-col gap-1">
+              {request.impact.map((line) => (
+                <li
+                  key={line}
+                  className="text-sm font-black leading-snug text-[#313131]"
+                >
+                  ・{line}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {request.beforeAfter.length > 0 && (
+          <section className="rounded-[1.25rem] border-[3px] border-[#313131] bg-[#f3f7f2] p-3">
+            <Badge className="rounded-full bg-[#1cb0f6] text-white">
+              Before / After
+            </Badge>
+            <div className="mt-2 flex flex-col gap-2">
+              {request.beforeAfter.map((metric) => (
+                <div
+                  key={metric.label}
+                  className="rounded-2xl bg-white p-2"
+                >
+                  <p className="text-xs font-black text-[#53635a]">
+                    {metric.label}
+                  </p>
+                  <div className="mt-1 grid grid-cols-2 gap-2 text-sm font-black">
+                    <div className="rounded-xl bg-[#f0f4ef] px-2 py-1 text-[#53635a]">
+                      <span className="block text-[10px]">Before</span>
+                      {metric.before}
+                    </div>
+                    <div className="rounded-xl bg-[#e6f7d6] px-2 py-1 text-[#3a7d00]">
+                      <span className="block text-[10px]">After</span>
+                      {metric.after}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function RequestCard({
   request,
   map,
   onReaction,
+  onShowDetails,
+  isAdmin,
+  onRemove,
 }: {
   request: MoveRequest;
   map: MapDefinition;
   onReaction: (reaction: ReactionKey) => void;
+  onShowDetails: () => void;
+  isAdmin: boolean;
+  onRemove: () => void;
 }) {
   const destination = getLocation(request.destinationId, map);
   const total = getRequestSupportTotal(request);
   const reached = total >= REQUEST_SUPPORT_THRESHOLD;
+  const achieved = reached || request.status === "adopted";
   const ratio = Math.min(
     100,
     Math.round((total / REQUEST_SUPPORT_THRESHOLD) * 100)
@@ -1402,12 +1569,12 @@ function RequestCard({
           <div className="flex flex-wrap items-center gap-2">
             <Badge
               className={
-                request.status === "adopted"
+                achieved
                   ? "bg-[#58cc02] text-white"
                   : "bg-[#1cb0f6] text-white"
               }
             >
-              {request.status === "adopted" ? "採択中" : "候補"}
+              {achieved ? "採択中" : "候補"}
             </Badge>
             <Badge className="rounded-full bg-[#ff9600] text-white">
               {requesterLabel}
@@ -1419,28 +1586,22 @@ function RequestCard({
           <h3 className="mt-2 text-base font-black leading-snug">
             {request.title}
           </h3>
-          <p className="mt-1 text-sm font-bold text-[#53635a]">{request.note}</p>
         </div>
-        <div className="grid size-12 shrink-0 place-items-center rounded-full bg-white text-2xl">
-          {destination.icon}
+        <div className="flex shrink-0 items-start gap-1">
+          {isAdmin ? (
+            <button
+              type="button"
+              onClick={onRemove}
+              aria-label="この申請を削除"
+              className="grid size-9 place-items-center rounded-xl border-2 border-[#e35d6a] bg-white text-[#e35d6a] transition active:scale-95"
+            >
+              <Trash2Icon className="size-4" />
+            </button>
+          ) : null}
+          <div className="grid size-12 shrink-0 place-items-center rounded-full bg-white text-2xl">
+            {destination.icon}
+          </div>
         </div>
-      </div>
-
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        {(Object.keys(reactionLabels) as ReactionKey[]).map((reaction) => (
-          <button
-            key={reaction}
-            type="button"
-            onClick={() => onReaction(reaction)}
-            disabled={reached}
-            className="min-h-13 rounded-2xl bg-white px-2 text-xs font-black transition active:scale-95 disabled:opacity-60"
-          >
-            {reactionLabels[reaction]}
-            <span className="block text-base text-[#58cc02]">
-              {request.reactions[reaction]}
-            </span>
-          </button>
-        ))}
       </div>
 
       <div className="mt-3 flex flex-col gap-1">
@@ -1460,6 +1621,26 @@ function RequestCard({
             ? "応援が目標に到達し、ロボットへ指令が出ました。"
             : `あと${remaining}件の応援で指令が出ます。`}
         </p>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          className="h-12 rounded-2xl text-sm font-black"
+          onClick={onShowDetails}
+        >
+          詳細
+        </Button>
+        <button
+          type="button"
+          onClick={() => onReaction("cheer")}
+          disabled={reached}
+          className="h-12 rounded-2xl border-2 border-[#313131] bg-[#58cc02] px-3 text-sm font-black text-white shadow-[0_3px_0_#313131] transition active:translate-y-0.5 active:shadow-none disabled:opacity-60 disabled:active:translate-y-0 disabled:active:shadow-[0_3px_0_#313131]"
+        >
+          応援する
+          <span className="ml-2 text-xs">+1</span>
+        </button>
       </div>
     </article>
   );

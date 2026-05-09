@@ -164,6 +164,19 @@ export function addRequest(
   });
 }
 
+export function removeRequest(
+  state: DemoState,
+  requestId: string
+): DemoState {
+  const stillReferenced =
+    state.activeCommand?.requestId === requestId ? null : state.activeCommand;
+  return touchState({
+    ...state,
+    requests: state.requests.filter((request) => request.id !== requestId),
+    activeCommand: stillReferenced,
+  });
+}
+
 export function issueCommand(
   state: DemoState,
   requestId: string,

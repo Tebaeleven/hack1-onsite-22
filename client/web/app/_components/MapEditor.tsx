@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckIcon, PlusIcon, Trash2Icon, XIcon } from "lucide-react";
+import { CheckIcon, MapPinIcon, PlusIcon, Trash2Icon, XIcon } from "lucide-react";
 import { toast } from "sonner";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,10 +23,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  TILE_CODE_TO_KIND,
-  TILE_KINDS,
-  TILE_KIND_LABEL,
-  TILE_KIND_TO_CODE,
   createEmptyMapGrid,
   defaultMapDefinition,
 } from "@/lib/bus-stop-demo/data";
@@ -34,43 +31,20 @@ import type {
   GridPoint,
   MapDefinition,
   MapFeature,
-  TileKind,
 } from "@/lib/bus-stop-demo/types";
+import type { TileKindDef } from "@/lib/tiles/types";
 
 const MAX_DIM = 32;
 const MIN_DIM = 3;
 
-const tileBgClass: Record<TileKind, string> = {
-  grass: "bg-[#78c95e]",
-  road: "bg-[#9fb0b8]",
-  intersection: "bg-[#97aab4]",
-  house: "bg-[#80ce62]",
-  shop: "bg-[#d8b85c]",
-  company: "bg-[#87d6e7]",
-  hospital: "bg-[#f8aeba]",
-  school: "bg-[#c3a7f6]",
-  station: "bg-[#95d8f6]",
-  park: "bg-[#86d968]",
-  tree: "bg-[#6fbe55]",
-  busStop: "bg-[#fff2b8]",
-};
+const ZOOM_OPTIONS = [24, 32, 40, 48] as const;
+const DEFAULT_ZOOM = 40;
 
-const tileEmoji: Record<TileKind, string> = {
-  grass: "",
-  road: "",
-  intersection: "✚",
-  house: "🏠",
-  shop: "🏪",
-  company: "🏢",
-  hospital: "🏥",
-  school: "🎓",
-  station: "🚉",
-  park: "🎪",
-  tree: "🌳",
-  busStop: "🚌",
-};
+const FALLBACK_BG = "#78c95e";
+const FALLBACK_LABEL = "?";
 
-type EditorMode = "size" | "poi";
+type EditorMode = "size" | "spot";
+type PickStage = "none" | "grid" | "roadAccess";
 
 type FeatureDraft = MapFeature;
 
@@ -79,6 +53,7 @@ type Props = {
   onOpenChange: (open: boolean) => void;
   map: MapDefinition | null; // null なら新規作成扱い (createMap)
   onSaved: (saved: MapDefinition) => void;
+  tileKinds: TileKindDef[];
 };
 
 function reshapeGrid(
@@ -102,7 +77,27 @@ function setCell(grid: string[], row: number, col: number, code: string): string
   });
 }
 
-export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
+// 隣接 4 マスから道路 (road / intersection) を探す
+function findAdjacentRoad(
+  grid: string[],
+  row: number,
+  col: number,
+  roadCodes: Set<string>
+): GridPoint | null {
+  const cands: GridPoint[] = [
+    { row: row - 1, col },
+    { row: row + 1, col },
+    { row, col: col - 1 },
+    { row, col: col + 1 },
+  ];
+  for (const c of cands) {
+    const code = grid[c.row]?.[c.col];
+    if (code && roadCodes.has(code)) return c;
+  }
+  return null;
+}
+
+export function MapEditor({ open, onOpenChange, map, onSaved, tileKinds }: Props) {
   const isNew = map === null;
   const [name, setName] = useState("");
   const [rows, setRows] = useState(defaultMapDefinition.rows);
@@ -111,11 +106,61 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
     createEmptyMapGrid(defaultMapDefinition.rows, defaultMapDefinition.cols)
   );
   const [features, setFeatures] = useState<FeatureDraft[]>([]);
-  const [selectedTile, setSelectedTile] = useState<TileKind>("road");
+  const [selectedTile, setSelectedTile] = useState<string>("road");
   const [mode, setMode] = useState<EditorMode>("size");
   const [editingFeatureId, setEditingFeatureId] = useState<string | null>(null);
+  const [pickStage, setPickStage] = useState<PickStage>("none");
+  const [cellPx, setCellPx] = useState<number>(DEFAULT_ZOOM);
   const [saving, setSaving] = useState(false);
   const isPaintingRef = useRef(false);
+
+  // tile_kinds から派生する各種マップ
+  const defByKind = useMemo(() => {
+    const map = new Map<string, TileKindDef>();
+    for (const def of tileKinds) map.set(def.kind, def);
+    return map;
+  }, [tileKinds]);
+
+  const kindByCode = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const def of tileKinds) map.set(def.code, def.kind);
+    return map;
+  }, [tileKinds]);
+
+  const sortedTileKinds = useMemo(
+    () =>
+      [...tileKinds].sort(
+        (a, b) => a.sortOrder - b.sortOrder || a.kind.localeCompare(b.kind)
+      ),
+    [tileKinds]
+  );
+
+  const buildingTileKinds = useMemo(
+    () => sortedTileKinds.filter((d) => d.isBuilding),
+    [sortedTileKinds]
+  );
+
+  const roadCodes = useMemo(() => {
+    const set = new Set<string>();
+    for (const def of tileKinds) {
+      if (def.kind === "road" || def.kind === "intersection") set.add(def.code);
+    }
+    return set;
+  }, [tileKinds]);
+
+  const codeToCellInfo = (code: string | undefined) => {
+    const kind = code ? kindByCode.get(code) : undefined;
+    const def = kind ? defByKind.get(kind) : undefined;
+    return {
+      bgColor: def?.bgColor ?? FALLBACK_BG,
+      emoji: def?.emoji ?? "",
+      label: def?.label ?? FALLBACK_LABEL,
+    };
+  };
+
+  const selectedTileDef = defByKind.get(selectedTile);
+  const selectedTileLabel = selectedTileDef?.label ?? selectedTile;
+  const selectedTileCode = selectedTileDef?.code ?? "g";
 
   // open または map が変わったときに state を初期化
   useEffect(() => {
@@ -135,7 +180,20 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
     }
     setMode("size");
     setEditingFeatureId(null);
-  }, [open, map]);
+    setPickStage("none");
+    setCellPx(DEFAULT_ZOOM);
+    if (defByKind.has("road")) setSelectedTile("road");
+  }, [open, map, defByKind]);
+
+  // Esc でピック中断
+  useEffect(() => {
+    if (pickStage === "none") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPickStage("none");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pickStage]);
 
   const handleResize = (nextRows: number, nextCols: number) => {
     const r = Math.max(MIN_DIM, Math.min(MAX_DIM, Math.floor(nextRows)));
@@ -143,7 +201,7 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
     setRows(r);
     setCols(c);
     setGrid((current) => reshapeGrid(current, r, c));
-    // POI が範囲外になったら除外
+    // スポットが範囲外になったら除外
     setFeatures((current) =>
       current.filter(
         (f) => f.grid.row < r && f.grid.col < c && f.roadAccess.row < r && f.roadAccess.col < c
@@ -152,8 +210,7 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
   };
 
   const paintCell = (row: number, col: number) => {
-    const code = TILE_KIND_TO_CODE[selectedTile];
-    setGrid((current) => setCell(current, row, col, code));
+    setGrid((current) => setCell(current, row, col, selectedTileCode));
   };
 
   const editingFeature = useMemo(
@@ -162,13 +219,14 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
   );
 
   const handleAddFeature = () => {
-    const id = `poi-${Date.now().toString(36)}`;
+    const id = `spot-${Date.now().toString(36)}`;
+    const houseDef = defByKind.get("house");
     const next: FeatureDraft = {
       id,
       label: "新しい場所",
       shortLabel: "場所",
       kind: "community",
-      tileKind: "house",
+      tileKind: houseDef?.kind ?? "house",
       grid: { row: 0, col: 0 },
       roadAccess: { row: 0, col: 0 },
       color: "#58cc02",
@@ -178,7 +236,7 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
     };
     setFeatures((current) => [...current, next]);
     setEditingFeatureId(id);
-    setMode("poi");
+    setMode("spot");
   };
 
   const handleUpdateFeature = (id: string, patch: Partial<FeatureDraft>) => {
@@ -190,6 +248,65 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
   const handleDeleteFeature = (id: string) => {
     setFeatures((current) => current.filter((f) => f.id !== id));
     if (editingFeatureId === id) setEditingFeatureId(null);
+  };
+
+  const startPickGrid = () => {
+    if (!editingFeature) return;
+    setPickStage("grid");
+  };
+
+  const handleCellMouseDown = (row: number, col: number) => {
+    // クリック配置モードを優先
+    if (pickStage !== "none" && editingFeature) {
+      if (pickStage === "grid") {
+        const buildingDef = defByKind.get(editingFeature.tileKind) ?? defByKind.get("house");
+        const buildingCode = buildingDef?.code ?? "h";
+        // 建物セルを書き込み
+        setGrid((current) => setCell(current, row, col, buildingCode));
+        // 隣接道路を探す
+        const adj = findAdjacentRoad(grid, row, col, roadCodes);
+        if (adj) {
+          handleUpdateFeature(editingFeature.id, {
+            grid: { row, col },
+            roadAccess: adj,
+          });
+          setPickStage("none");
+          toast.success("建物のマスと隣接バス停を自動で設定しました");
+        } else {
+          handleUpdateFeature(editingFeature.id, {
+            grid: { row, col },
+            roadAccess: { row, col },
+          });
+          setPickStage("roadAccess");
+          toast.message("続けて、バス停のマスをクリックしてください");
+        }
+        return;
+      }
+      if (pickStage === "roadAccess") {
+        handleUpdateFeature(editingFeature.id, {
+          roadAccess: { row, col },
+        });
+        setPickStage("none");
+        return;
+      }
+    }
+    // スポット編集タブ中はタイル上書きを禁止し、既存スポットの選択切替のみ
+    if (mode === "spot") {
+      const spotHere = features.find(
+        (f) => f.grid.row === row && f.grid.col === col
+      );
+      if (spotHere) setEditingFeatureId(spotHere.id);
+      return;
+    }
+    // サイズタブ: 通常のペイントモード
+    isPaintingRef.current = true;
+    paintCell(row, col);
+  };
+
+  const handleCellMouseEnter = (row: number, col: number) => {
+    if (pickStage !== "none") return;
+    if (mode === "spot") return;
+    if (isPaintingRef.current) paintCell(row, col);
   };
 
   const handleSave = async () => {
@@ -220,6 +337,9 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
     }
   };
 
+  const cellEmojiClass =
+    cellPx >= 44 ? "text-xl" : cellPx >= 36 ? "text-lg" : cellPx >= 28 ? "text-base" : "text-sm";
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="!max-w-[min(96vw,1200px)] !w-[min(96vw,1200px)] max-h-[92vh] overflow-hidden p-0 sm:max-w-[min(96vw,1200px)]">
@@ -229,7 +349,7 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
               {isNew ? "マップを新規作成" : `マップを編集: ${map?.name}`}
             </DialogTitle>
             <DialogDescription>
-              タイルパレットから選んで、マス目をクリックでペイントします。
+              タイルパレットから選んで、マス目をクリックでペイントします。スポットは「📍 地図で位置を指定」で直感的に配置できます。
             </DialogDescription>
           </DialogHeader>
 
@@ -240,21 +360,22 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
                 <CardTitle>タイル</CardTitle>
               </CardHeader>
               <CardContent className="grid grid-cols-2 gap-2">
-                {TILE_KINDS.map((kind) => (
+                {sortedTileKinds.map((def) => (
                   <Button
-                    key={kind}
+                    key={def.kind}
                     type="button"
-                    variant={kind === selectedTile ? "default" : "outline"}
+                    variant={def.kind === selectedTile ? "default" : "outline"}
                     size="sm"
-                    onClick={() => setSelectedTile(kind)}
+                    onClick={() => setSelectedTile(def.kind)}
                     className="h-auto flex-col gap-1 py-2"
                   >
                     <span
-                      className={`grid size-7 place-items-center rounded ${tileBgClass[kind]} text-base`}
+                      className="grid size-7 place-items-center rounded text-base"
+                      style={{ backgroundColor: def.bgColor }}
                     >
-                      {tileEmoji[kind]}
+                      {def.emoji}
                     </span>
-                    <span className="text-[10px]">{TILE_KIND_LABEL[kind]}</span>
+                    <span className="text-[10px]">{def.label}</span>
                   </Button>
                 ))}
               </CardContent>
@@ -262,20 +383,33 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
 
             {/* Center: grid editor */}
             <Card className="min-h-0 overflow-hidden">
-              <CardHeader className="flex-row items-center justify-between gap-3">
+              <CardHeader className="flex-row flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
                   <CardTitle>マップ ({rows}×{cols})</CardTitle>
                   <Badge variant="secondary" className="text-xs">
-                    選択: {TILE_KIND_LABEL[selectedTile]}
+                    選択: {selectedTileLabel}
                   </Badge>
                 </div>
-                <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-muted-foreground">ズーム</span>
+                  {ZOOM_OPTIONS.map((z) => (
+                    <Button
+                      key={z}
+                      type="button"
+                      size="sm"
+                      variant={cellPx === z ? "default" : "outline"}
+                      onClick={() => setCellPx(z)}
+                      className="h-7 px-2 text-[10px]"
+                    >
+                      {z}
+                    </Button>
+                  ))}
                   <Label htmlFor="map-name" className="sr-only">マップ名</Label>
                   <Input
                     id="map-name"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="h-8 w-48"
+                    className="h-8 w-40"
                     placeholder="マップ名"
                   />
                 </div>
@@ -289,37 +423,83 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
                   isPaintingRef.current = false;
                 }}
               >
+                {pickStage !== "none" ? (
+                  <Alert className="mb-3 border-[#1cb0f6] bg-[#e0f5ff]">
+                    <AlertDescription className="font-bold">
+                      {pickStage === "grid"
+                        ? "🟦 建物のマスをクリックしてください (Esc でキャンセル)"
+                        : "🟨 バス停のマス (道路上) をクリックしてください (Esc でキャンセル)"}
+                    </AlertDescription>
+                  </Alert>
+                ) : mode === "spot" ? (
+                  <Alert className="mb-3 border-[#ffcf32] bg-[#fff8d6]">
+                    <AlertDescription className="text-xs font-bold leading-relaxed">
+                      📌 スポット編集モード: タイルのペイントは無効です。タイル編集は「サイズ」タブに切り替えてください。
+                      編集中スポットの<span className="text-[#1cb0f6]">建物🟦</span>と<span className="text-[#ad7800]">バス停🟨</span>が地図上に色付き枠で表示されます。
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
                 <div
                   className="mx-auto grid w-fit gap-px rounded border border-border bg-border p-px"
                   style={{
-                    gridTemplateColumns: `repeat(${cols}, 28px)`,
-                    gridTemplateRows: `repeat(${rows}, 28px)`,
+                    gridTemplateColumns: `repeat(${cols}, ${cellPx}px)`,
+                    gridTemplateRows: `repeat(${rows}, ${cellPx}px)`,
                   }}
                 >
                   {Array.from({ length: rows }).map((_, r) =>
                     Array.from({ length: cols }).map((_, c) => {
                       const code = grid[r]?.[c] ?? "g";
-                      const kind = TILE_CODE_TO_KIND[code] ?? "grass";
+                      const cell = codeToCellInfo(code);
                       const featuresHere = features.filter(
                         (f) => f.grid.row === r && f.grid.col === c
                       );
+                      const isEditingBuilding =
+                        editingFeature !== null &&
+                        editingFeature.grid.row === r &&
+                        editingFeature.grid.col === c;
+                      const isEditingRoad =
+                        editingFeature !== null &&
+                        editingFeature.roadAccess.row === r &&
+                        editingFeature.roadAccess.col === c;
+                      const cursor =
+                        pickStage !== "none"
+                          ? "cursor-crosshair"
+                          : mode === "spot"
+                            ? "cursor-pointer"
+                            : "";
+                      const editShadow = isEditingBuilding
+                        ? "inset 0 0 0 3px #1cb0f6"
+                        : isEditingRoad
+                          ? "inset 0 0 0 3px #ffcf32"
+                          : undefined;
                       return (
                         <button
                           key={`${r}:${c}`}
                           type="button"
-                          onMouseDown={() => {
-                            isPaintingRef.current = true;
-                            paintCell(r, c);
+                          onMouseDown={() => handleCellMouseDown(r, c)}
+                          onMouseEnter={() => handleCellMouseEnter(r, c)}
+                          className={`relative grid place-items-center hover:ring-2 hover:ring-foreground/40 ${cellEmojiClass} ${cursor} ${editShadow ? "z-10" : ""}`}
+                          style={{
+                            width: cellPx,
+                            height: cellPx,
+                            backgroundColor: cell.bgColor,
+                            boxShadow: editShadow,
                           }}
-                          onMouseEnter={() => {
-                            if (isPaintingRef.current) paintCell(r, c);
-                          }}
-                          className={`relative grid size-[28px] place-items-center text-xs ${tileBgClass[kind]} hover:ring-2 hover:ring-foreground/40`}
-                          title={`(${r},${c}) ${TILE_KIND_LABEL[kind]}${featuresHere.length > 0 ? ` / POI:${featuresHere[0].label}` : ""}`}
+                          title={`(${r},${c}) ${cell.label}${featuresHere.length > 0 ? ` / スポット:${featuresHere[0].label}` : ""}${isEditingBuilding ? " / 編集中スポットの建物🟦" : ""}${isEditingRoad ? " / 編集中スポットのバス停🟨" : ""}`}
                         >
-                          {tileEmoji[kind] || ""}
+                          {cell.emoji || ""}
                           {featuresHere.length > 0 ? (
                             <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-red-500 ring-1 ring-white" />
+                          ) : null}
+                          {isEditingBuilding ? (
+                            <span className="absolute left-0.5 top-0.5 rounded-sm bg-[#1cb0f6] px-1 text-[8px] font-black leading-tight text-white">
+                              建物
+                            </span>
+                          ) : null}
+                          {isEditingRoad && !isEditingBuilding ? (
+                            <span className="absolute left-0.5 top-0.5 rounded-sm bg-[#ffcf32] px-1 text-[8px] font-black leading-tight text-[#25302b]">
+                              バス停
+                            </span>
                           ) : null}
                         </button>
                       );
@@ -329,7 +509,7 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
               </CardContent>
             </Card>
 
-            {/* Right: size or POI panel */}
+            {/* Right: size or spot panel */}
             <Card className="min-h-0 overflow-hidden">
               <CardHeader className="border-b">
                 <div className="flex gap-2">
@@ -344,10 +524,10 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
                   <Button
                     type="button"
                     size="sm"
-                    variant={mode === "poi" ? "default" : "outline"}
-                    onClick={() => setMode("poi")}
+                    variant={mode === "spot" ? "default" : "outline"}
+                    onClick={() => setMode("spot")}
                   >
-                    POI ({features.length})
+                    スポット ({features.length})
                   </Button>
                 </div>
               </CardHeader>
@@ -383,30 +563,31 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
                       />
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      範囲: {MIN_DIM}〜{MAX_DIM}。サイズを縮めると、はみ出した POI は自動で削除されます。
+                      範囲: {MIN_DIM}〜{MAX_DIM}。サイズを縮めると、はみ出したスポットは自動で削除されます。
                     </p>
                   </div>
                 ) : (
                   <div className="grid gap-3">
                     <Button type="button" size="sm" onClick={handleAddFeature}>
                       <PlusIcon data-icon="inline-start" />
-                      POI を追加
+                      スポットを追加
                     </Button>
                     <div className="grid gap-2">
                       {features.length === 0 ? (
                         <p className="text-xs text-muted-foreground">
-                          まだ POI がありません。
+                          まだスポットがありません。
                         </p>
                       ) : (
                         features.map((f) => (
                           <button
                             key={f.id}
                             type="button"
-                            onClick={() =>
+                            onClick={() => {
                               setEditingFeatureId(
                                 editingFeatureId === f.id ? null : f.id
-                              )
-                            }
+                              );
+                              setPickStage("none");
+                            }}
                             className={`flex items-center gap-2 rounded border px-2 py-1.5 text-left text-xs ${
                               editingFeatureId === f.id
                                 ? "border-primary bg-primary/10"
@@ -431,10 +612,14 @@ export function MapEditor({ open, onOpenChange, map, onSaved }: Props) {
                         feature={editingFeature}
                         rows={rows}
                         cols={cols}
+                        buildingTileKinds={buildingTileKinds}
+                        pickStage={pickStage}
                         onChange={(patch) =>
                           handleUpdateFeature(editingFeature.id, patch)
                         }
                         onDelete={() => handleDeleteFeature(editingFeature.id)}
+                        onStartPick={startPickGrid}
+                        onCancelPick={() => setPickStage("none")}
                       />
                     ) : null}
                   </div>
@@ -468,14 +653,22 @@ function FeatureForm({
   feature,
   rows,
   cols,
+  buildingTileKinds,
+  pickStage,
   onChange,
   onDelete,
+  onStartPick,
+  onCancelPick,
 }: {
   feature: FeatureDraft;
   rows: number;
   cols: number;
+  buildingTileKinds: TileKindDef[];
+  pickStage: PickStage;
   onChange: (patch: Partial<FeatureDraft>) => void;
   onDelete: () => void;
+  onStartPick: () => void;
+  onCancelPick: () => void;
 }) {
   const setGridPart = (key: "grid" | "roadAccess", part: keyof GridPoint, value: number) => {
     const max = part === "row" ? rows - 1 : cols - 1;
@@ -486,7 +679,7 @@ function FeatureForm({
   return (
     <Card className="border-primary/30 bg-primary/5">
       <CardHeader>
-        <CardTitle className="text-sm">POI を編集</CardTitle>
+        <CardTitle className="text-sm">スポットを編集</CardTitle>
       </CardHeader>
       <CardContent className="grid gap-2 text-xs">
         <div>
@@ -569,21 +762,105 @@ function FeatureForm({
           <select
             id={`f-tile-${feature.id}`}
             value={feature.tileKind}
-            onChange={(e) =>
-              onChange({ tileKind: e.target.value as TileKind })
-            }
+            onChange={(e) => onChange({ tileKind: e.target.value })}
             className="mt-1 h-8 w-full rounded-md border bg-background px-2 text-xs"
           >
-            {TILE_KINDS.map((k) => (
-              <option key={k} value={k}>
-                {TILE_KIND_LABEL[k]}
+            {buildingTileKinds.map((def) => (
+              <option key={def.kind} value={def.kind}>
+                {def.label}
               </option>
             ))}
+            {buildingTileKinds.find((d) => d.kind === feature.tileKind) ? null : (
+              <option value={feature.tileKind}>{feature.tileKind}</option>
+            )}
           </select>
         </div>
+
+        <div className="rounded border border-dashed border-primary/40 bg-white p-2">
+          <Label className="text-[11px]">配置</Label>
+          {pickStage === "none" ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="default"
+              onClick={onStartPick}
+              className="mt-1 w-full"
+            >
+              <MapPinIcon data-icon="inline-start" />
+              地図で位置を指定
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onCancelPick}
+              className="mt-1 w-full"
+            >
+              <XIcon data-icon="inline-start" />
+              配置をキャンセル
+            </Button>
+          )}
+        </div>
+
+        {/* 位置プレビュー: 建物 → バス停の関係を視覚化 */}
+        <div className="flex items-center justify-around gap-2 rounded bg-white p-2">
+          <div className="flex flex-col items-center gap-1">
+            <span
+              className="grid size-9 place-items-center rounded text-lg text-white shadow-[0_2px_0_rgba(0,0,0,0.18)]"
+              style={{ backgroundColor: "#1cb0f6" }}
+            >
+              {feature.icon || "🏠"}
+            </span>
+            <span className="text-[10px] font-black text-[#1cb0f6]">建物</span>
+            <span className="text-[10px] text-muted-foreground">
+              ({feature.grid.row}, {feature.grid.col})
+            </span>
+          </div>
+          <span className="text-base text-[#53635a]">→</span>
+          <div className="flex flex-col items-center gap-1">
+            <span
+              className="grid size-9 place-items-center rounded text-lg shadow-[0_2px_0_rgba(0,0,0,0.18)]"
+              style={{ backgroundColor: "#ffcf32" }}
+            >
+              🚌
+            </span>
+            <span className="text-[10px] font-black text-[#ad7800]">バス停</span>
+            <span className="text-[10px] text-muted-foreground">
+              ({feature.roadAccess.row}, {feature.roadAccess.col})
+            </span>
+          </div>
+        </div>
+
+        {/* 位置の説明枠 */}
+        <div className="rounded border border-dashed border-[#ffcf32] bg-[#fff8d6] p-2 text-[11px] leading-relaxed">
+          <p className="mb-1 font-black">📌 位置の見方</p>
+          <p className="flex items-center gap-1">
+            <span
+              className="inline-block size-2 rounded-sm"
+              style={{ backgroundColor: "#1cb0f6" }}
+            />
+            <span>
+              <b>建物のマス</b>: 建物アイコンが立つ場所
+            </span>
+          </p>
+          <p className="flex items-center gap-1">
+            <span
+              className="inline-block size-2 rounded-sm"
+              style={{ backgroundColor: "#ffcf32" }}
+            />
+            <span>
+              <b>バス停のマス</b>: バスが実際に停まる<u>道路</u>マス。建物のすぐ隣の道路を選んでください
+            </span>
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            「📍 地図で位置を指定」を使うと、隣接道路があれば自動でバス停も埋まります。
+          </p>
+        </div>
+
         <div className="grid grid-cols-2 gap-2">
           <div>
-            <Label>建物 row</Label>
+            <Label>建物のマス・行 (row)</Label>
             <Input
               type="number"
               min={0}
@@ -594,7 +871,7 @@ function FeatureForm({
             />
           </div>
           <div>
-            <Label>建物 col</Label>
+            <Label>建物のマス・列 (col)</Label>
             <Input
               type="number"
               min={0}
@@ -607,7 +884,7 @@ function FeatureForm({
         </div>
         <div className="grid grid-cols-2 gap-2">
           <div>
-            <Label>道路アクセス row</Label>
+            <Label>バス停のマス・行 (row)</Label>
             <Input
               type="number"
               min={0}
@@ -620,7 +897,7 @@ function FeatureForm({
             />
           </div>
           <div>
-            <Label>道路アクセス col</Label>
+            <Label>バス停のマス・列 (col)</Label>
             <Input
               type="number"
               min={0}
@@ -666,7 +943,7 @@ function FeatureForm({
           onClick={onDelete}
         >
           <Trash2Icon data-icon="inline-start" />
-          この POI を削除
+          このスポットを削除
         </Button>
       </CardContent>
     </Card>

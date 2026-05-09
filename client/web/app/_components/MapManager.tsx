@@ -1,7 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { CheckCircle2Icon, PencilIcon, PlusIcon, StarIcon, Trash2Icon } from "lucide-react";
+import {
+  CheckCircle2Icon,
+  LayersIcon,
+  PencilIcon,
+  PlusIcon,
+  StarIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,19 +23,31 @@ import {
 } from "@/components/ui/dialog";
 import { deleteMap, setDefaultMap } from "@/lib/maps/queries";
 import type { MapDefinition } from "@/lib/bus-stop-demo/types";
+import type { TileKindDef } from "@/lib/tiles/types";
 import { MapEditor } from "./MapEditor";
+import { TileKindManager } from "./TileKindManager";
 
 type Props = {
   maps: MapDefinition[];
   activeMapId: string | null;
   onActivate: (id: string) => void;
   onChanged: () => void; // refetch
+  tileKinds: TileKindDef[];
+  onTileKindsChanged: () => void;
 };
 
-export function MapManager({ maps, activeMapId, onActivate, onChanged }: Props) {
+export function MapManager({
+  maps,
+  activeMapId,
+  onActivate,
+  onChanged,
+  tileKinds,
+  onTileKindsChanged,
+}: Props) {
   const [editorMap, setEditorMap] = useState<MapDefinition | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<MapDefinition | null>(null);
+  const [tileManagerOpen, setTileManagerOpen] = useState(false);
 
   const openCreate = () => {
     setEditorMap(null);
@@ -73,10 +92,20 @@ export function MapManager({ maps, activeMapId, onActivate, onChanged }: Props) 
             複数のマップを登録・切替できます。エディタでタイルを自由に編集できます。
           </p>
         </div>
-        <Button type="button" onClick={openCreate}>
-          <PlusIcon data-icon="inline-start" />
-          新規作成
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setTileManagerOpen(true)}
+          >
+            <LayersIcon data-icon="inline-start" />
+            タイル種類を管理
+          </Button>
+          <Button type="button" onClick={openCreate}>
+            <PlusIcon data-icon="inline-start" />
+            新規作成
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-3">
@@ -107,7 +136,7 @@ export function MapManager({ maps, activeMapId, onActivate, onChanged }: Props) 
                       ) : null}
                     </CardTitle>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {map.rows}×{map.cols} / POI {map.features.length}件 / slug: {map.slug}
+                      {map.rows}×{map.cols} / スポット {map.features.length}件 / slug: {map.slug}
                     </p>
                   </div>
                 </CardHeader>
@@ -164,6 +193,14 @@ export function MapManager({ maps, activeMapId, onActivate, onChanged }: Props) 
         onOpenChange={setEditorOpen}
         map={editorMap}
         onSaved={() => onChanged()}
+        tileKinds={tileKinds}
+      />
+
+      <TileKindManager
+        open={tileManagerOpen}
+        onOpenChange={setTileManagerOpen}
+        tileKinds={tileKinds}
+        onChanged={onTileKindsChanged}
       />
 
       <Dialog

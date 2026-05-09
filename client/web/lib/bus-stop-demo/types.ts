@@ -34,12 +34,14 @@ export type GridPoint = {
   col: number;
 };
 
+// tileKind は組み込み TileKind に加え、ユーザーが tile_kinds テーブルで
+// 追加した kind 文字列も入りうる。3D 描画側は default → grass で吸収する。
 export type MapFeature = {
   id: string;
   label: string;
   shortLabel: string;
   kind: LocationKind;
-  tileKind: TileKind;
+  tileKind: TileKind | string;
   grid: GridPoint;
   roadAccess: GridPoint;
   color: string;
