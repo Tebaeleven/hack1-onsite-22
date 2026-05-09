@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import {
   ArrowLeftIcon,
@@ -16,17 +16,21 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   TILE_SIZE,
-  TOWN_GRID,
+  defaultMapDefinition,
   findRoadRoute,
   getLocation,
   getTileKind,
   gridKey,
   gridToWorld,
-  mapFeatures,
 } from "@/lib/bus-stop-demo/data";
 import { updateRobotStatus } from "@/lib/bus-stop-demo/state";
-import type { GridPoint, TileKind } from "@/lib/bus-stop-demo/types";
+import type {
+  GridPoint,
+  MapDefinition,
+  TileKind,
+} from "@/lib/bus-stop-demo/types";
 import { useSyncedDemoState } from "@/lib/bus-stop-demo/use-synced-demo-state";
+import { getDefaultMap, getMap } from "@/lib/maps/queries";
 
 type ThreeRefs = {
   renderer: THREE.WebGLRenderer;
@@ -56,9 +60,31 @@ export function VoxelRobotDemo() {
   const refs = useRef<ThreeRefs | null>(null);
   const arrivalCommandRef = useRef<string | null>(null);
   const { state, updateState } = useSyncedDemoState();
+  const [currentMap, setCurrentMap] = useState<MapDefinition>(defaultMapDefinition);
+
+  // activeMapId が変わったらリモートからマップを取得
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const fetched = state.activeMapId
+        ? await getMap(state.activeMapId)
+        : await getDefaultMap();
+      if (!cancelled && fetched) setCurrentMap(fetched);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.activeMapId]);
+
   const command = state.activeCommand;
-  const fromLocation = getLocation(command?.fromLocationId ?? state.currentLocationId);
-  const toLocation = getLocation(command?.toLocationId ?? state.selectedDestinationId);
+  const fromLocation = getLocation(
+    command?.fromLocationId ?? state.currentLocationId,
+    currentMap
+  );
+  const toLocation = getLocation(
+    command?.toLocationId ?? state.selectedDestinationId,
+    currentMap
+  );
   const impact = command?.impact ?? [
     "アプリの申請を受け取ると、ロボットが目的地へ移動します。",
     "到着後に新しいバス停位置として案内します。",
@@ -102,16 +128,25 @@ export function VoxelRobotDemo() {
     sun.shadow.mapSize.set(2048, 2048);
     scene.add(sun);
 
-    buildWorld(scene);
+    buildWorld(scene, currentMap);
     const robot = createBusStopRobot();
-    robot.position.copy(gridToVector(getLocation("station").roadAccess));
+    const startLocation = getLocation(state.currentLocationId, currentMap);
+    robot.position.copy(gridToVector(startLocation.roadAccess, currentMap));
     scene.add(robot);
 
     const targetMarker = createTargetMarker();
-    targetMarker.position.copy(gridToVector(getLocation("hospital").roadAccess));
+    const targetLocation = getLocation(
+      command?.toLocationId ?? state.selectedDestinationId,
+      currentMap
+    );
+    targetMarker.position.copy(gridToVector(targetLocation.roadAccess, currentMap));
     scene.add(targetMarker);
 
-    const initialRoute = findRoadRoute("station", "hospital").map(gridToVector);
+    const initialRoute = findRoadRoute(
+      startLocation.id,
+      targetLocation.id,
+      currentMap
+    ).map((p) => gridToVector(p, currentMap));
     const routeLine = createRouteLine(initialRoute);
     scene.add(routeLine);
 
@@ -180,7 +215,9 @@ export function VoxelRobotDemo() {
       refs.current.renderer.domElement.remove();
       refs.current = null;
     };
-  }, []);
+    // currentMap が変わるとシーンを丸ごと作り直す
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentMap]);
 
   useEffect(() => {
     const active = refs.current;
@@ -188,8 +225,9 @@ export function VoxelRobotDemo() {
 
     const routePoints = findRoadRoute(
       command?.fromLocationId ?? state.currentLocationId,
-      command?.toLocationId ?? state.selectedDestinationId
-    ).map(gridToVector);
+      command?.toLocationId ?? state.selectedDestinationId,
+      currentMap
+    ).map((p) => gridToVector(p, currentMap));
     const start = routePoints[0];
     const target = routePoints[routePoints.length - 1];
 
@@ -213,7 +251,7 @@ export function VoxelRobotDemo() {
     if (command?.id) {
       arrivalCommandRef.current = null;
     }
-  }, [command, state.currentLocationId, state.selectedDestinationId, state.robotStatus]);
+  }, [command, state.currentLocationId, state.selectedDestinationId, state.robotStatus, currentMap]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -365,22 +403,22 @@ function PanelRow({
   );
 }
 
-function buildWorld(scene: THREE.Scene) {
-  const groundWidth = TOWN_GRID[0].length * TILE_SIZE;
-  const groundDepth = TOWN_GRID.length * TILE_SIZE;
+function buildWorld(scene: THREE.Scene, map: MapDefinition) {
+  const groundWidth = map.cols * TILE_SIZE;
+  const groundDepth = map.rows * TILE_SIZE;
   const ground = box("#58cc02", groundWidth + 0.9, 0.35, groundDepth + 0.9, 0, -0.22, 0);
   ground.receiveShadow = true;
   scene.add(ground);
 
   const featureByGrid = new Map(
-    mapFeatures.map((feature) => [gridKey(feature.grid), feature])
+    map.features.map((feature) => [gridKey(feature.grid), feature])
   );
 
-  TOWN_GRID.forEach((row, rowIndex) => {
+  map.grid.forEach((row, rowIndex) => {
     [...row].forEach((_, colIndex) => {
       const point = { row: rowIndex, col: colIndex };
-      const kind = getTileKind(point);
-      const position = gridToWorld(point);
+      const kind = getTileKind(point, map.grid);
+      const position = gridToWorld(point, map.rows, map.cols);
       scene.add(createGroundTile(kind, position.x, position.z));
 
       const feature = featureByGrid.get(gridKey(point));
@@ -416,11 +454,15 @@ function buildWorld(scene: THREE.Scene) {
     });
   });
 
-  const bus = createVoxelBus();
-  const busPoint = gridToWorld({ row: 6, col: 2 });
-  bus.position.set(busPoint.x, 0.25, busPoint.z);
-  bus.rotation.y = Math.PI / 2;
-  scene.add(bus);
+  // 駅前に既存バス車両を1台 (マップの最初の駅 feature を基準にする)
+  const station = map.features.find((f) => f.kind === "station") ?? map.features[0];
+  if (station) {
+    const bus = createVoxelBus();
+    const busPoint = gridToWorld(station.roadAccess, map.rows, map.cols);
+    bus.position.set(busPoint.x, 0.25, busPoint.z);
+    bus.rotation.y = Math.PI / 2;
+    scene.add(bus);
+  }
 }
 
 function createGroundTile(kind: TileKind, x: number, z: number) {
@@ -635,8 +677,8 @@ function roundRect(
   context.closePath();
 }
 
-function gridToVector(point: GridPoint) {
-  const world = gridToWorld(point);
+function gridToVector(point: GridPoint, map: MapDefinition) {
+  const world = gridToWorld(point, map.rows, map.cols);
   return new THREE.Vector3(world.x, 0.28, world.z);
 }
 

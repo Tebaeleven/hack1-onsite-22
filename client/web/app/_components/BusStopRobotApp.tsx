@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   BotIcon,
   Building2Icon,
   BusIcon,
   CheckCircle2Icon,
+  LayoutGridIcon,
   MapIcon,
   MegaphoneIcon,
   MessageCircleIcon,
@@ -15,6 +16,7 @@ import {
   PlusIcon,
   RotateCcwIcon,
   SearchIcon,
+  ShieldIcon,
   SparklesIcon,
   UserIcon,
 } from "lucide-react";
@@ -41,16 +43,14 @@ import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import {
   REQUEST_SUPPORT_THRESHOLD,
-  TOWN_COLS,
-  TOWN_GRID,
-  TOWN_ROWS,
+  defaultMapDefinition,
   findRoadRoute,
   getLocation,
   getMapFeature,
+  getMapLocations,
   getScenario,
   getTileKind,
   gridKey,
-  locations,
 } from "@/lib/bus-stop-demo/data";
 import {
   addReaction,
@@ -63,6 +63,7 @@ import {
 } from "@/lib/bus-stop-demo/state";
 import type {
   GridPoint,
+  MapDefinition,
   MoveCommand,
   MoveRequest,
   ReactionKey,
@@ -72,10 +73,12 @@ import type {
   TileKind,
 } from "@/lib/bus-stop-demo/types";
 import { useSyncedDemoState } from "@/lib/bus-stop-demo/use-synced-demo-state";
+import { getDefaultMap, listMaps } from "@/lib/maps/queries";
 import { cn } from "@/lib/utils";
+import { MapManager } from "./MapManager";
 
-type AppTab = "map" | "events" | "requests" | "impact" | "profile";
-type UserPresetId = "resident" | "senior" | "business";
+type AppTab = "map" | "events" | "requests" | "impact" | "profile" | "maps";
+type UserPresetId = "resident" | "senior" | "business" | "admin";
 type TileDirections = {
   up: boolean;
   right: boolean;
@@ -107,17 +110,21 @@ const statusLabel: Record<RobotStatus, string> = {
   guiding: "案内中",
 };
 
-const bottomTabs: Array<{
-  id: AppTab;
-  label: string;
-  icon: ReactNode;
-}> = [
+type BottomTab = { id: AppTab; label: string; icon: ReactNode };
+
+const baseBottomTabs: BottomTab[] = [
   { id: "map", label: "マップ", icon: <MapIcon /> },
   { id: "events", label: "イベント", icon: <SearchIcon /> },
   { id: "requests", label: "申請", icon: <MessageCircleIcon /> },
   { id: "impact", label: "効果", icon: <SparklesIcon /> },
   { id: "profile", label: "プロフィール", icon: <UserIcon /> },
 ];
+
+const adminMapsTab: BottomTab = {
+  id: "maps",
+  label: "マップ管理",
+  icon: <LayoutGridIcon />,
+};
 
 const userPresets: UserPreset[] = [
   {
@@ -150,6 +157,16 @@ const userPresets: UserPreset[] = [
     defaultAudience: "企業イベント参加者",
     defaultNote: "参加者が駅から迷わず来られるようにしたいです。",
   },
+  {
+    id: "admin",
+    label: "管理者",
+    icon: <ShieldIcon className="size-5" />,
+    scenarioId: "shopping",
+    requestType: "citizen",
+    defaultReason: "地域の声を確認したい",
+    defaultAudience: "運営",
+    defaultNote: "マップを切り替えて、デモシナリオを管理します。",
+  },
 ];
 
 const userPresetById = Object.fromEntries(
@@ -160,8 +177,36 @@ function optionOrFirst(options: string[], preferred: string) {
   return options.includes(preferred) ? preferred : options[0] ?? "";
 }
 
+function useMapDefinitions(activeMapId: string | null) {
+  const [maps, setMaps] = useState<MapDefinition[]>([]);
+  const [defaultMap, setDefaultMap] = useState<MapDefinition>(defaultMapDefinition);
+  const [loaded, setLoaded] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [list, def] = await Promise.all([listMaps(), getDefaultMap()]);
+      setMaps(list);
+      setDefaultMap(def);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const currentMap =
+    (activeMapId ? maps.find((m) => m.id === activeMapId) : null) ?? defaultMap;
+
+  return { maps, currentMap, loaded, refresh };
+}
+
 export function BusStopRobotApp() {
   const { state, updateState } = useSyncedDemoState();
+  const { maps, currentMap, refresh: refreshMaps } = useMapDefinitions(
+    state.activeMapId
+  );
   const [activeTab, setActiveTab] = useState<AppTab>("map");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [profileSetupOpen, setProfileSetupOpen] = useState(true);
@@ -170,8 +215,12 @@ export function BusStopRobotApp() {
   const [hasSelectedDestination, setHasSelectedDestination] = useState(false);
   const selectedPreset = userPresetById[userPresetId];
   const scenario = getScenario(state.scenarioId);
-  const selectedLocation = getLocation(state.selectedDestinationId);
-  const currentLocation = getLocation(state.currentLocationId);
+  const selectedLocation = getLocation(state.selectedDestinationId, currentMap);
+  const currentLocation = getLocation(state.currentLocationId, currentMap);
+  const bottomTabs = useMemo<BottomTab[]>(
+    () => (userPresetId === "admin" ? [...baseBottomTabs, adminMapsTab] : baseBottomTabs),
+    [userPresetId]
+  );
   const scenarioRequests = useMemo(
     () =>
       state.requests
@@ -225,16 +274,28 @@ export function BusStopRobotApp() {
         after.scenarioId === reacted.scenarioId
           ? reacted
           : switchScenario(reacted, after.scenarioId);
-      return issueCommand(switched, requestId);
+      return issueCommand(switched, requestId, currentMap);
     });
 
     if (triggered && triggeredRequest) {
-      const destination = getLocation((triggeredRequest as MoveRequest).destinationId);
+      const destination = getLocation(
+        (triggeredRequest as MoveRequest).destinationId,
+        currentMap
+      );
       toast.success("応援が目標に到達しました", {
         description: `${destination.name}へバス停ロボットが向かいます。`,
       });
       setActiveTab("impact");
     }
+  };
+
+  const handleActivateMap = (mapId: string) => {
+    updateState((current) => ({
+      ...current,
+      activeMapId: mapId,
+      updatedAt: new Date().toISOString(),
+    }));
+    toast.success("マップを切り替えました");
   };
 
   const handlePresetChange = (presetId: UserPresetId, nextTab: AppTab = "map") => {
@@ -245,6 +306,13 @@ export function BusStopRobotApp() {
     setHasSelectedDestination(false);
     setActiveTab(nextTab);
   };
+
+  // 管理者から他プロファイルに切り替えたとき、マップ管理タブに居たらマップへ戻す
+  useEffect(() => {
+    if (userPresetId !== "admin" && activeTab === "maps") {
+      setActiveTab("map");
+    }
+  }, [userPresetId, activeTab]);
 
   const handleInitialPresetSelect = (presetId: UserPresetId) => {
     handlePresetChange(presetId, "map");
@@ -258,21 +326,25 @@ export function BusStopRobotApp() {
     const destinationId = String(
       formData.get("destinationId") ?? state.selectedDestinationId
     );
-    const destination = getLocation(destinationId);
+    const destination = getLocation(destinationId, currentMap);
 
     updateState((current) =>
-      addRequest(current, {
-        requestType,
-        title: String(formData.get("title") ?? ""),
-        destinationId,
-        desiredTime: String(formData.get("desiredTime") ?? ""),
-        reason: String(formData.get("reason") ?? scenario.reasonOptions[0]),
-        audience: String(formData.get("audience") ?? scenario.audienceOptions[0]),
-        note: String(formData.get("note") ?? ""),
-        eventName: String(formData.get("eventName") ?? ""),
-        expectedPeople: String(formData.get("expectedPeople") ?? ""),
-        sponsored: formData.get("sponsored") === "on",
-      })
+      addRequest(
+        current,
+        {
+          requestType,
+          title: String(formData.get("title") ?? ""),
+          destinationId,
+          desiredTime: String(formData.get("desiredTime") ?? ""),
+          reason: String(formData.get("reason") ?? scenario.reasonOptions[0]),
+          audience: String(formData.get("audience") ?? scenario.audienceOptions[0]),
+          note: String(formData.get("note") ?? ""),
+          eventName: String(formData.get("eventName") ?? ""),
+          expectedPeople: String(formData.get("expectedPeople") ?? ""),
+          sponsored: formData.get("sponsored") === "on",
+        },
+        currentMap
+      )
     );
 
     setDialogOpen(false);
@@ -317,11 +389,12 @@ export function BusStopRobotApp() {
         </header>
 
         {state.activeCommand && activeTab !== "impact" ? (
-          <CommandNotice command={state.activeCommand} />
+          <CommandNotice command={state.activeCommand} map={currentMap} />
         ) : null}
 
         {activeTab === "map" ? (
           <MapTab
+            map={currentMap}
             currentLocationId={state.currentLocationId}
             selectedDestinationId={state.selectedDestinationId}
             adoptedRequest={activeRequest}
@@ -332,13 +405,16 @@ export function BusStopRobotApp() {
           />
         ) : null}
 
-        {activeTab === "events" ? <EventsTab /> : null}
+        {activeTab === "events" ? <EventsTab map={currentMap} /> : null}
 
         {activeTab === "requests" ? (
           <RequestsTab
             requests={state.requests}
+            map={currentMap}
             onReaction={handleReact}
-            onReset={() => updateState(resetDemoState(state.scenarioId))}
+            onReset={() =>
+              updateState(resetDemoState(state.scenarioId, state.activeMapId))
+            }
           />
         ) : null}
 
@@ -359,9 +435,18 @@ export function BusStopRobotApp() {
             onPresetChange={(presetId) => handlePresetChange(presetId, "profile")}
           />
         ) : null}
+
+        {activeTab === "maps" && userPresetId === "admin" ? (
+          <MapManager
+            maps={maps}
+            activeMapId={state.activeMapId ?? currentMap.id}
+            onActivate={handleActivateMap}
+            onChanged={refreshMaps}
+          />
+        ) : null}
       </div>
 
-      <BottomTabBar activeTab={activeTab} onChange={setActiveTab} />
+      <BottomTabBar tabs={bottomTabs} activeTab={activeTab} onChange={setActiveTab} />
 
       <RequestDialog
         open={dialogOpen}
@@ -396,7 +481,7 @@ function UserPresetSelector({
       <p className="mb-2 text-sm font-black text-[#58a700]">
         {title}
       </p>
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         {userPresets.map((preset) => {
           const active = preset.id === selectedPresetId;
           return (
@@ -422,19 +507,26 @@ function UserPresetSelector({
   );
 }
 
-function CommandNotice({ command }: { command: MoveCommand }) {
+function CommandNotice({
+  command,
+  map,
+}: {
+  command: MoveCommand;
+  map: MapDefinition;
+}) {
   return (
     <Alert className="rounded-[1.25rem] border-4 border-[#58cc02] bg-[#e8ffd9] p-3 text-[#25302b] shadow-[0_4px_0_#2f8d12]">
       <MegaphoneIcon />
       <AlertDescription className="text-sm font-black">
-        移動指令を発行しました。{getLocation(command.fromLocationId).shortName}
-        から{getLocation(command.toLocationId).shortName}へ向かいます。
+        移動指令を発行しました。{getLocation(command.fromLocationId, map).shortName}
+        から{getLocation(command.toLocationId, map).shortName}へ向かいます。
       </AlertDescription>
     </Alert>
   );
 }
 
 function MapTab({
+  map,
   currentLocationId,
   selectedDestinationId,
   adoptedRequest,
@@ -443,6 +535,7 @@ function MapTab({
   onSelect,
   onCall,
 }: {
+  map: MapDefinition;
   currentLocationId: string;
   selectedDestinationId: string;
   adoptedRequest?: MoveRequest;
@@ -455,6 +548,7 @@ function MapTab({
     <section className="flex min-h-0 flex-1 flex-col">
       <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[1.25rem] border-2 border-[#b8c7c9] bg-white">
         <DemoMap
+          map={map}
           currentLocationId={currentLocationId}
           selectedDestinationId={selectedDestinationId}
           adoptedRequest={adoptedRequest}
@@ -552,7 +646,7 @@ const eventDefinitions: EventDefinition[] = [
 
 const eventCategories = ["すべて", "地域", "企業", "医療", "学校"] as const;
 
-function EventsTab() {
+function EventsTab({ map }: { map: MapDefinition }) {
   const [activeCategory, setActiveCategory] =
     useState<(typeof eventCategories)[number]>("すべて");
   const [detailsEventId, setDetailsEventId] = useState<string | null>(null);
@@ -593,7 +687,7 @@ function EventsTab() {
 
       <div className="grid gap-3">
         {filteredEvents.map((event) => {
-          const destination = getLocation(event.locationId);
+          const destination = getLocation(event.locationId, map);
           return (
             <article
               key={event.id}
@@ -645,6 +739,7 @@ function EventsTab() {
 
       <EventDetailsDialog
         event={detailsEvent}
+        map={map}
         onOpenChange={(open) => {
           if (!open) setDetailsEventId(null);
         }}
@@ -655,9 +750,11 @@ function EventsTab() {
 
 function EventDetailsDialog({
   event,
+  map,
   onOpenChange,
 }: {
   event: EventDefinition | null;
+  map: MapDefinition;
   onOpenChange: (open: boolean) => void;
 }) {
   const open = event !== null;
@@ -665,7 +762,7 @@ function EventDetailsDialog({
     return <Dialog open={open} onOpenChange={onOpenChange} />;
   }
 
-  const destination = getLocation(event.locationId);
+  const destination = getLocation(event.locationId, map);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -728,10 +825,12 @@ type RequestFilterId = (typeof requestFilters)[number]["id"];
 
 function RequestsTab({
   requests,
+  map,
   onReaction,
   onReset,
 }: {
   requests: MoveRequest[];
+  map: MapDefinition;
   onReaction: (requestId: string, reaction: ReactionKey) => void;
   onReset: () => void;
 }) {
@@ -793,6 +892,7 @@ function RequestsTab({
             <RequestCard
               key={request.id}
               request={request}
+              map={map}
               onReaction={(reaction) => onReaction(request.id, reaction)}
             />
           ))
@@ -921,6 +1021,7 @@ function ProfileTab({
 }
 
 function DemoMap({
+  map,
   currentLocationId,
   selectedDestinationId,
   adoptedRequest,
@@ -929,6 +1030,7 @@ function DemoMap({
   onSelect,
   onCall,
 }: {
+  map: MapDefinition;
   currentLocationId: string;
   selectedDestinationId: string;
   adoptedRequest?: MoveRequest;
@@ -937,15 +1039,16 @@ function DemoMap({
   onSelect: (locationId: string) => void;
   onCall: () => void;
 }) {
+  const mapLocations = useMemo(() => getMapLocations(map), [map]);
   const route = activeCommand
-    ? findRoadRoute(activeCommand.fromLocationId, activeCommand.toLocationId)
-    : findRoadRoute(currentLocationId, selectedDestinationId);
+    ? findRoadRoute(activeCommand.fromLocationId, activeCommand.toLocationId, map)
+    : findRoadRoute(currentLocationId, selectedDestinationId, map);
   const routeKeys = new Set(route.map(gridKey));
   const targetLocationId = activeCommand?.toLocationId ?? selectedDestinationId;
-  const currentAccessKey = gridKey(getLocation(currentLocationId).roadAccess);
-  const targetAccessKey = gridKey(getLocation(targetLocationId).roadAccess);
+  const currentAccessKey = gridKey(getLocation(currentLocationId, map).roadAccess);
+  const targetAccessKey = gridKey(getLocation(targetLocationId, map).roadAccess);
   const locationByGrid = new Map(
-    locations.map((location) => [gridKey(location.grid), location])
+    mapLocations.map((location) => [gridKey(location.grid), location])
   );
 
   return (
@@ -954,21 +1057,21 @@ function DemoMap({
         <div
           className="absolute inset-0 grid overflow-hidden rounded-xl bg-[#78c95e] shadow-[inset_0_0_22px_rgba(38,93,42,0.28)]"
           style={{
-            gridTemplateColumns: `repeat(${TOWN_COLS}, minmax(0, 1fr))`,
-            gridTemplateRows: `repeat(${TOWN_ROWS}, minmax(0, 1fr))`,
+            gridTemplateColumns: `repeat(${map.cols}, minmax(0, 1fr))`,
+            gridTemplateRows: `repeat(${map.rows}, minmax(0, 1fr))`,
           }}
         >
-          {TOWN_GRID.flatMap((row, rowIndex) =>
+          {map.grid.flatMap((row, rowIndex) =>
             [...row].map((_, colIndex) => {
               const point: GridPoint = { row: rowIndex, col: colIndex };
               const key = gridKey(point);
-              const kind = getTileKind(point);
+              const kind = getTileKind(point, map.grid);
               const location = locationByGrid.get(key);
               const isRoute = routeKeys.has(key);
               const isCurrentRoad = key === currentAccessKey;
               const isTargetRoad = key === targetAccessKey;
               const roadDirections = isRoadKind(kind)
-                ? getRoadDirections(point)
+                ? getRoadDirections(point, map.grid)
                 : null;
               const routeDirections = isRoute
                 ? getRouteDirections(point, routeKeys)
@@ -999,6 +1102,7 @@ function DemoMap({
                   {location ? (
                     <LocationTileButton
                       locationId={location.id}
+                      map={map}
                       isCurrent={location.id === currentLocationId}
                       isSelected={location.id === selectedDestinationId}
                       isAdopted={location.id === adoptedRequest?.destinationId}
@@ -1030,7 +1134,7 @@ function DemoMap({
         <span className="rounded-full bg-white px-2 py-1">赤: 目的地</span>
       </div>
       <div className="mt-2 flex flex-wrap gap-1.5">
-        {locations.map((location) => (
+        {mapLocations.map((location) => (
           <span
             key={location.id}
             className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-[10px] font-black text-[#25302b]"
@@ -1117,9 +1221,12 @@ function isRoadKind(kind: TileKind) {
   return kind === "road" || kind === "intersection";
 }
 
-function getRoadDirections(point: GridPoint): TileDirections {
+function getRoadDirections(
+  point: GridPoint,
+  grid: readonly string[]
+): TileDirections {
   return getNeighborDirections(point, (candidate) =>
-    isRoadKind(getTileKind(candidate))
+    isRoadKind(getTileKind(candidate, grid))
   );
 }
 
@@ -1176,19 +1283,21 @@ function MapChip({ kind }: { kind: TileKind }) {
 
 function LocationTileButton({
   locationId,
+  map,
   isCurrent,
   isSelected,
   isAdopted,
   onSelect,
 }: {
   locationId: string;
+  map: MapDefinition;
   isCurrent: boolean;
   isSelected: boolean;
   isAdopted: boolean;
   onSelect: (locationId: string) => void;
 }) {
-  const location = getLocation(locationId);
-  const feature = getMapFeature(locationId);
+  const location = getLocation(locationId, map);
+  const feature = getMapFeature(locationId, map);
 
   return (
     <button
@@ -1266,12 +1375,14 @@ function RouteRow({ label, value }: { label: string; value: string }) {
 
 function RequestCard({
   request,
+  map,
   onReaction,
 }: {
   request: MoveRequest;
+  map: MapDefinition;
   onReaction: (reaction: ReactionKey) => void;
 }) {
-  const destination = getLocation(request.destinationId);
+  const destination = getLocation(request.destinationId, map);
   const total = getRequestSupportTotal(request);
   const reached = total >= REQUEST_SUPPORT_THRESHOLD;
   const ratio = Math.min(
@@ -1363,16 +1474,21 @@ function EmptyPanel({ text }: { text: string }) {
 }
 
 function BottomTabBar({
+  tabs,
   activeTab,
   onChange,
 }: {
+  tabs: BottomTab[];
   activeTab: AppTab;
   onChange: (tab: AppTab) => void;
 }) {
   return (
     <nav className="fixed inset-x-0 bottom-0 z-50 border-t-4 border-[#313131] bg-white/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur">
-      <div className="mx-auto grid max-w-[520px] grid-cols-5 gap-1">
-        {bottomTabs.map((tab) => (
+      <div
+        className="mx-auto grid max-w-[520px] gap-1"
+        style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}
+      >
+        {tabs.map((tab) => (
           <button
             key={tab.id}
             type="button"

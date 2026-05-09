@@ -1,6 +1,12 @@
-import { createInitialDemoState, getLocation, getScenario } from "./data";
+import {
+  createInitialDemoState,
+  defaultMapDefinition,
+  getLocation,
+  getScenario,
+} from "./data";
 import type {
   DemoState,
+  MapDefinition,
   MoveCommand,
   MoveRequest,
   ReactionKey,
@@ -90,10 +96,11 @@ export function addReaction(
 
 export function createMoveRequest(
   state: DemoState,
-  input: RequestInput
+  input: RequestInput,
+  map: MapDefinition = defaultMapDefinition
 ): MoveRequest {
   const scenario = getScenario(state.scenarioId);
-  const destination = getLocation(input.destinationId);
+  const destination = getLocation(input.destinationId, map);
   const isBusiness = input.requestType === "business";
   const eventPrefix = input.eventName ? `${input.eventName}: ` : "";
   const expected = input.expectedPeople || "20";
@@ -144,8 +151,12 @@ export function createMoveRequest(
   };
 }
 
-export function addRequest(state: DemoState, input: RequestInput): DemoState {
-  const request = createMoveRequest(state, input);
+export function addRequest(
+  state: DemoState,
+  input: RequestInput,
+  map: MapDefinition = defaultMapDefinition
+): DemoState {
+  const request = createMoveRequest(state, input, map);
   return touchState({
     ...state,
     selectedDestinationId: request.destinationId,
@@ -153,11 +164,15 @@ export function addRequest(state: DemoState, input: RequestInput): DemoState {
   });
 }
 
-export function issueCommand(state: DemoState, requestId: string): DemoState {
+export function issueCommand(
+  state: DemoState,
+  requestId: string,
+  map: MapDefinition = defaultMapDefinition
+): DemoState {
   const request = state.requests.find((item) => item.id === requestId);
   if (!request) return state;
 
-  const destination = getLocation(request.destinationId);
+  const destination = getLocation(request.destinationId, map);
   const command: MoveCommand = {
     id: makeId("cmd"),
     requestId,
@@ -204,6 +219,9 @@ export function updateRobotStatus(
   });
 }
 
-export function resetDemoState(scenarioId?: ScenarioId): DemoState {
-  return createInitialDemoState(scenarioId);
+export function resetDemoState(
+  scenarioId?: ScenarioId,
+  activeMapId: string | null = null
+): DemoState {
+  return createInitialDemoState(scenarioId, activeMapId);
 }

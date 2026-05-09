@@ -3,6 +3,7 @@ import type {
   DemoScenario,
   DemoState,
   GridPoint,
+  MapDefinition,
   MapFeature,
   MoveRequest,
   ScenarioId,
@@ -45,13 +46,66 @@ const tileKindByCode: Record<string, TileKind> = {
   b: "busStop",
 };
 
-export function getTileKind(point: GridPoint): TileKind {
-  const code = TOWN_GRID[point.row]?.[point.col] ?? "g";
+// 1文字コード ↔ TileKind の双方向変換テーブル (エディタが使う)
+export const TILE_CODE_TO_KIND: Readonly<Record<string, TileKind>> = tileKindByCode;
+export const TILE_KIND_TO_CODE: Readonly<Record<TileKind, string>> = {
+  grass: "g",
+  road: "r",
+  intersection: "+",
+  house: "h",
+  shop: "s",
+  company: "c",
+  hospital: "p",
+  school: "u",
+  station: "a",
+  park: "e",
+  tree: "t",
+  busStop: "b",
+};
+
+export const TILE_KINDS: readonly TileKind[] = [
+  "grass",
+  "road",
+  "intersection",
+  "house",
+  "shop",
+  "company",
+  "hospital",
+  "school",
+  "station",
+  "park",
+  "tree",
+  "busStop",
+];
+
+export const TILE_KIND_LABEL: Record<TileKind, string> = {
+  grass: "草地",
+  road: "道路",
+  intersection: "交差点",
+  house: "住宅",
+  shop: "店舗",
+  company: "会社",
+  hospital: "病院",
+  school: "学校",
+  station: "駅",
+  park: "公園",
+  tree: "樹木",
+  busStop: "バス停",
+};
+
+export function getTileKind(
+  point: GridPoint,
+  grid: readonly string[] = TOWN_GRID
+): TileKind {
+  const code = grid[point.row]?.[point.col] ?? "g";
   return tileKindByCode[code] ?? "grass";
 }
 
-export function isRoadTile(point: GridPoint) {
-  const kind = getTileKind(point);
+export function isRoadTile(
+  point: GridPoint,
+  grid: readonly string[] = TOWN_GRID
+) {
+  const kind = getTileKind(point, grid);
   return kind === "road" || kind === "intersection";
 }
 
@@ -63,17 +117,25 @@ export function sameGridPoint(a: GridPoint, b: GridPoint) {
   return a.row === b.row && a.col === b.col;
 }
 
-export function gridToMapPercent(point: GridPoint) {
+export function gridToMapPercent(
+  point: GridPoint,
+  rows: number = TOWN_ROWS,
+  cols: number = TOWN_COLS
+) {
   return {
-    x: ((point.col + 0.5) / TOWN_COLS) * 100,
-    y: ((point.row + 0.5) / TOWN_ROWS) * 100,
+    x: ((point.col + 0.5) / cols) * 100,
+    y: ((point.row + 0.5) / rows) * 100,
   };
 }
 
-export function gridToWorld(point: GridPoint) {
+export function gridToWorld(
+  point: GridPoint,
+  rows: number = TOWN_ROWS,
+  cols: number = TOWN_COLS
+) {
   return {
-    x: (point.col - (TOWN_COLS - 1) / 2) * TILE_SIZE,
-    z: (point.row - (TOWN_ROWS - 1) / 2) * TILE_SIZE,
+    x: (point.col - (cols - 1) / 2) * TILE_SIZE,
+    z: (point.row - (rows - 1) / 2) * TILE_SIZE,
   };
 }
 
@@ -89,6 +151,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#3B82F6",
     icon: "🚉",
     height: 1.45,
+    description: "鉄道と路線バスの乗り換え拠点",
   },
   {
     id: "hospital",
@@ -101,6 +164,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#FB7185",
     icon: "🏥",
     height: 1.35,
+    description: "午前中の通院需要が集中する医療拠点",
   },
   {
     id: "supermarket",
@@ -113,6 +177,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#F59E0B",
     icon: "🛒",
     height: 1.25,
+    description: "買い物と荷物の持ち帰りを支える生活拠点",
   },
   {
     id: "market",
@@ -125,6 +190,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#22C55E",
     icon: "🎪",
     height: 1.2,
+    description: "週末イベントと飲食店が集まるにぎわい拠点",
   },
   {
     id: "school",
@@ -137,6 +203,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#A855F7",
     icon: "🎓",
     height: 1.3,
+    description: "学生イベントや部活動の集合場所",
   },
   {
     id: "company",
@@ -149,6 +216,7 @@ export const mapFeatures: MapFeature[] = [
     color: "#06B6D4",
     icon: "🏢",
     height: 1.8,
+    description: "地元企業説明会と採用イベントの会場",
   },
   {
     id: "housing",
@@ -161,32 +229,52 @@ export const mapFeatures: MapFeature[] = [
     color: "#84CC16",
     icon: "🏘️",
     height: 1.05,
+    description: "高齢者世帯が多く、バス停まで距離がある住宅地",
   },
 ];
 
-const descriptions: Record<string, string> = {
-  station: "鉄道と路線バスの乗り換え拠点",
-  hospital: "午前中の通院需要が集中する医療拠点",
-  supermarket: "買い物と荷物の持ち帰りを支える生活拠点",
-  market: "週末イベントと飲食店が集まるにぎわい拠点",
-  school: "学生イベントや部活動の集合場所",
-  company: "地元企業説明会と採用イベントの会場",
-  housing: "高齢者世帯が多く、バス停まで距離がある住宅地",
+// SSR・Supabase接続前のフォールバック用デフォルトマップ
+export const defaultMapDefinition: MapDefinition = {
+  id: "town-default-fallback",
+  slug: "town-default",
+  name: "みんなのまち",
+  rows: TOWN_ROWS,
+  cols: TOWN_COLS,
+  grid: [...TOWN_GRID],
+  features: mapFeatures,
+  isDefault: true,
+  updatedAt: "1970-01-01T00:00:00.000Z",
 };
 
-export const locations: BusStopLocation[] = mapFeatures.map((feature) => ({
-  id: feature.id,
-  name: feature.label,
-  shortName: feature.shortLabel,
-  kind: feature.kind,
-  grid: feature.grid,
-  roadAccess: feature.roadAccess,
-  map: gridToMapPercent(feature.grid),
-  world: gridToWorld(feature.roadAccess),
-  color: feature.color,
-  icon: feature.icon,
-  description: descriptions[feature.id],
-}));
+function buildLocation(
+  feature: MapFeature,
+  rows: number,
+  cols: number
+): BusStopLocation {
+  return {
+    id: feature.id,
+    name: feature.label,
+    shortName: feature.shortLabel,
+    kind: feature.kind,
+    grid: feature.grid,
+    roadAccess: feature.roadAccess,
+    map: gridToMapPercent(feature.grid, rows, cols),
+    world: gridToWorld(feature.roadAccess, rows, cols),
+    color: feature.color,
+    icon: feature.icon,
+    description: feature.description ?? "",
+  };
+}
+
+export function getMapLocations(
+  map: MapDefinition = defaultMapDefinition
+): BusStopLocation[] {
+  return map.features.map((feature) =>
+    buildLocation(feature, map.rows, map.cols)
+  );
+}
+
+export const locations: BusStopLocation[] = getMapLocations(defaultMapDefinition);
 
 export const scenarios: DemoScenario[] = [
   {
@@ -381,15 +469,27 @@ export function getScenario(id: ScenarioId) {
   return scenarios.find((scenario) => scenario.id === id) ?? scenarios[0];
 }
 
-export function getLocation(id: string) {
-  return locations.find((location) => location.id === id) ?? locations[0];
+export function getLocation(
+  id: string,
+  map: MapDefinition = defaultMapDefinition
+): BusStopLocation {
+  const feature = map.features.find((item) => item.id === id) ?? map.features[0];
+  if (!feature) {
+    return locations[0];
+  }
+  return buildLocation(feature, map.rows, map.cols);
 }
 
-export function getMapFeature(id: string) {
-  return mapFeatures.find((feature) => feature.id === id) ?? mapFeatures[0];
+export function getMapFeature(
+  id: string,
+  map: MapDefinition = defaultMapDefinition
+): MapFeature {
+  return map.features.find((feature) => feature.id === id) ?? map.features[0] ?? mapFeatures[0];
 }
 
-function getRoadNeighbors(point: GridPoint) {
+function getRoadNeighbors(point: GridPoint, grid: readonly string[]) {
+  const rows = grid.length;
+  const cols = grid[0]?.length ?? 0;
   return [
     { row: point.row - 1, col: point.col },
     { row: point.row + 1, col: point.col },
@@ -398,16 +498,20 @@ function getRoadNeighbors(point: GridPoint) {
   ].filter(
     (candidate) =>
       candidate.row >= 0 &&
-      candidate.row < TOWN_ROWS &&
+      candidate.row < rows &&
       candidate.col >= 0 &&
-      candidate.col < TOWN_COLS &&
-      isRoadTile(candidate)
+      candidate.col < cols &&
+      isRoadTile(candidate, grid)
   );
 }
 
-export function findRoadRoute(fromLocationId: string, toLocationId: string) {
-  const start = getLocation(fromLocationId).roadAccess;
-  const goal = getLocation(toLocationId).roadAccess;
+export function findRoadRoute(
+  fromLocationId: string,
+  toLocationId: string,
+  map: MapDefinition = defaultMapDefinition
+): GridPoint[] {
+  const start = getLocation(fromLocationId, map).roadAccess;
+  const goal = getLocation(toLocationId, map).roadAccess;
   const queue: GridPoint[] = [start];
   const visited = new Set([gridKey(start)]);
   const previous = new Map<string, GridPoint>();
@@ -428,7 +532,7 @@ export function findRoadRoute(fromLocationId: string, toLocationId: string) {
       return route;
     }
 
-    for (const next of getRoadNeighbors(current)) {
+    for (const next of getRoadNeighbors(current, map.grid)) {
       const key = gridKey(next);
       if (visited.has(key)) continue;
       visited.add(key);
@@ -440,7 +544,10 @@ export function findRoadRoute(fromLocationId: string, toLocationId: string) {
   return [start, goal];
 }
 
-export function getScenarioLocations(scenarioId: ScenarioId) {
+export function getScenarioLocations(
+  scenarioId: ScenarioId,
+  map: MapDefinition = defaultMapDefinition
+) {
   const scenario = getScenario(scenarioId);
   const locationIds = new Set([
     "station",
@@ -449,7 +556,7 @@ export function getScenarioLocations(scenarioId: ScenarioId) {
     ...scenario.regionInfo.map((item) => item.locationId),
   ]);
 
-  return locations.filter((location) => locationIds.has(location.id));
+  return getMapLocations(map).filter((location) => locationIds.has(location.id));
 }
 
 export function createSeedRequests(): MoveRequest[] {
@@ -465,7 +572,8 @@ export function createSeedRequests(): MoveRequest[] {
 export const REQUEST_SUPPORT_THRESHOLD = 60;
 
 export function createInitialDemoState(
-  scenarioId: ScenarioId = "medical"
+  scenarioId: ScenarioId = "medical",
+  activeMapId: string | null = null
 ): DemoState {
   const scenario = getScenario(scenarioId);
 
@@ -476,6 +584,40 @@ export function createInitialDemoState(
     selectedDestinationId: scenario.primaryDestinationId,
     requests: createSeedRequests(),
     activeCommand: null,
+    activeMapId,
     updatedAt: now(),
   };
+}
+
+// Supabase 行 (snake_case) を MapDefinition (camelCase) に変換するヘルパ。
+// queries.ts と Route Handler 双方から使うのでここに置く。
+export function mapRowToDefinition(row: {
+  id: string;
+  slug: string;
+  name: string;
+  rows: number;
+  cols: number;
+  grid: string[];
+  features: unknown;
+  is_default: boolean;
+  updated_at: string;
+}): MapDefinition {
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    rows: row.rows,
+    cols: row.cols,
+    grid: row.grid,
+    features: Array.isArray(row.features)
+      ? (row.features as MapFeature[])
+      : [],
+    isDefault: row.is_default,
+    updatedAt: row.updated_at,
+  };
+}
+
+// 空マップを作る (新規作成時)
+export function createEmptyMapGrid(rows: number, cols: number): string[] {
+  return Array.from({ length: rows }, () => "g".repeat(cols));
 }

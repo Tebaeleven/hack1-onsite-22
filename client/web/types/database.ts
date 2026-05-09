@@ -41,6 +41,45 @@ export type Database = {
         };
         Relationships: [];
       };
+      maps: {
+        Row: {
+          id: string;
+          slug: string;
+          name: string;
+          rows: number;
+          cols: number;
+          grid: string[];
+          features: Json;
+          is_default: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          slug: string;
+          name: string;
+          rows: number;
+          cols: number;
+          grid: string[];
+          features?: Json;
+          is_default?: boolean;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          slug?: string;
+          name?: string;
+          rows?: number;
+          cols?: number;
+          grid?: string[];
+          features?: Json;
+          is_default?: boolean;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

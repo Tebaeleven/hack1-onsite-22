@@ -45,6 +45,19 @@ export type MapFeature = {
   color: string;
   icon: string;
   height: number;
+  description?: string;
+};
+
+export type MapDefinition = {
+  id: string;
+  slug: string;
+  name: string;
+  rows: number;
+  cols: number;
+  grid: string[];
+  features: MapFeature[];
+  isDefault: boolean;
+  updatedAt: string;
 };
 
 export type BusStopLocation = {
@@ -136,5 +149,6 @@ export type DemoState = {
   selectedDestinationId: string;
   requests: MoveRequest[];
   activeCommand: MoveCommand | null;
+  activeMapId: string | null;
   updatedAt: string;
 };
