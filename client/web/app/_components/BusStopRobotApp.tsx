@@ -20,7 +20,13 @@ import {
   SparklesIcon,
   Trash2Icon,
   UserIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
 } from "lucide-react";
+import {
+  TransformComponent,
+  TransformWrapper,
+} from "react-zoom-pan-pinch";
 import { toast } from "sonner";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -70,15 +76,66 @@ import type {
   MoveRequest,
   ReactionKey,
   RequestType,
-  RobotStatus,
   ScenarioId,
   TileKind,
 } from "@/lib/bus-stop-demo/types";
 import { useSyncedDemoState } from "@/lib/bus-stop-demo/use-synced-demo-state";
 import { getDefaultMap, listMaps } from "@/lib/maps/queries";
 import { useTileKinds } from "@/lib/tiles/use-tile-kinds";
+import { useCurrentProfile } from "@/lib/profiles/use-current-profile";
+import { ALL_ROLES, ROLE_META } from "@/lib/profiles/types";
+import type { Profile } from "@/lib/profiles/types";
+import type { ProfileUpdate } from "@/lib/profiles/queries";
+import { useRequestReactions } from "@/lib/reactions/use-request-reactions";
+import { useMyReactedRequestIds } from "@/lib/reactions/use-my-reacted-requests";
+import type { RequestReactionSummary } from "@/lib/reactions/queries";
+import {
+  getMyOrganization,
+  selfVerifyMyOrganization,
+  upsertMyOrganization,
+  type Organization,
+  type OrgKind,
+} from "@/lib/organizations/queries";
+import { recordCommandLog } from "@/lib/stats/queries";
+import {
+  eventDefinitions,
+  eventCategories,
+  type EventDefinition,
+} from "@/lib/events/data";
+import { signOut } from "@/app/(auth)/actions";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { cn } from "@/lib/utils";
 import { MapManager } from "./MapManager";
+import { CommentsSection } from "./CommentsSection";
+import { ImpactTab } from "./ImpactTab";
+
+function summaryTotal(summary: RequestReactionSummary | undefined) {
+  if (!summary) return 0;
+  return summary.counts.wantToGo + summary.counts.helpful + summary.counts.cheer;
+}
+
+function combinedSupportTotal(
+  request: MoveRequest,
+  summary: RequestReactionSummary | undefined
+) {
+  return getRequestSupportTotal(request) + summaryTotal(summary);
+}
+
+// ホーム→目的地の徒歩(分) と バス停移動後(分) を Manhattan 距離で概算する。
+// バス停移動後は roadAccess までの距離。1グリッド = 2分歩行と仮定。
+const MIN_PER_GRID = 2;
+function manhattan(a: GridPoint, b: GridPoint) {
+  return Math.abs(a.row - b.row) + Math.abs(a.col - b.col);
+}
+function estimateHomeImpact(
+  homeGrid: GridPoint,
+  destinationFeatureGrid: GridPoint,
+  destinationAccessGrid: GridPoint
+) {
+  const before = manhattan(homeGrid, destinationFeatureGrid) * MIN_PER_GRID;
+  const after = manhattan(homeGrid, destinationAccessGrid) * MIN_PER_GRID;
+  return { before, after, saved: Math.max(0, before - after) };
+}
 
 type AppTab = "map" | "events" | "requests" | "impact" | "profile" | "maps";
 type UserPresetId = "resident" | "senior" | "business" | "admin";
@@ -98,13 +155,6 @@ type UserPreset = {
   defaultReason: string;
   defaultAudience: string;
   defaultNote: string;
-};
-
-const statusLabel: Record<RobotStatus, string> = {
-  idle: "待機中",
-  moving: "移動中",
-  arrived: "到着",
-  guiding: "案内中",
 };
 
 type BottomTab = { id: AppTab; label: string; icon: ReactNode };
@@ -205,6 +255,13 @@ export function BusStopRobotApp() {
     state.activeMapId
   );
   const { tileKinds, refresh: refreshTileKinds } = useTileKinds();
+  const { profile, userId, update: updateProfile } = useCurrentProfile();
+  const allRequestIds = useMemo(
+    () => state.requests.map((r) => r.id),
+    [state.requests]
+  );
+  const { summaries: reactionSummaries, add: addRequestReact } =
+    useRequestReactions(allRequestIds, userId);
   const [activeTab, setActiveTab] = useState<AppTab>("map");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [profileSetupOpen, setProfileSetupOpen] = useState(true);
@@ -214,7 +271,6 @@ export function BusStopRobotApp() {
   const selectedPreset = userPresetById[userPresetId];
   const scenario = getScenario(state.scenarioId);
   const selectedLocation = getLocation(state.selectedDestinationId, currentMap);
-  const currentLocation = getLocation(state.currentLocationId, currentMap);
   const bottomTabs = useMemo<BottomTab[]>(
     () => (userPresetId === "admin" ? [...baseBottomTabs, adminMapsTab] : baseBottomTabs),
     [userPresetId]
@@ -233,15 +289,6 @@ export function BusStopRobotApp() {
     scenarioRequests.find((request) => request.status === "adopted") ??
     scenarioRequests[0];
 
-  const totalSupport = scenarioRequests.reduce(
-    (total, request) =>
-      total +
-      request.reactions.wantToGo +
-      request.reactions.helpful +
-      request.reactions.cheer,
-    0
-  );
-
   const openRequestDialog = () => {
     setRequestType(selectedPreset.requestType);
     setDialogOpen(true);
@@ -254,37 +301,67 @@ export function BusStopRobotApp() {
   };
 
   const handleReact = (requestId: string, reaction: ReactionKey) => {
-    let triggered = false;
-    let triggeredRequest: MoveRequest | null = null;
-    updateState((current) => {
-      const before = current.requests.find((item) => item.id === requestId);
-      if (!before) return current;
-      const beforeTotal = getRequestSupportTotal(before);
-      const reacted = addReaction(current, requestId, reaction);
-      if (beforeTotal >= REQUEST_SUPPORT_THRESHOLD) return reacted;
-      const after = reacted.requests.find((item) => item.id === requestId);
-      if (!after) return reacted;
-      const afterTotal = getRequestSupportTotal(after);
-      if (afterTotal < REQUEST_SUPPORT_THRESHOLD) return reacted;
-      triggered = true;
-      triggeredRequest = after;
-      const switched =
-        after.scenarioId === reacted.scenarioId
-          ? reacted
-          : switchScenario(reacted, after.scenarioId);
-      return issueCommand(switched, requestId, currentMap);
-    });
+    const target = state.requests.find((r) => r.id === requestId);
+    if (!target) return;
+    const summary = reactionSummaries[requestId];
+    const beforeCombined = combinedSupportTotal(target, summary);
 
-    if (triggered && triggeredRequest) {
-      const destination = getLocation(
-        (triggeredRequest as MoveRequest).destinationId,
-        currentMap
-      );
+    // 既に達成済みなら何もしない
+    if (beforeCombined >= REQUEST_SUPPORT_THRESHOLD) return;
+
+    const triggerCommandIfReached = () => {
+      // 1 押すと +1 されるので、+1 で閾値到達するか確認
+      const reachedNow = beforeCombined + 1 >= REQUEST_SUPPORT_THRESHOLD;
+      if (!reachedNow) return;
+      let logPayload: Parameters<typeof recordCommandLog>[0] | null = null;
+      updateState((cur) => {
+        const switched =
+          target.scenarioId === cur.scenarioId
+            ? cur
+            : switchScenario(cur, target.scenarioId);
+        const next = issueCommand(switched, requestId, currentMap);
+        if (next.activeCommand) {
+          const route = findRoadRoute(
+            next.activeCommand.fromLocationId,
+            next.activeCommand.toLocationId,
+            currentMap
+          );
+          logPayload = {
+            commandId: next.activeCommand.id,
+            requestId,
+            scenarioId: next.scenarioId,
+            fromLocationId: next.activeCommand.fromLocationId,
+            toLocationId: next.activeCommand.toLocationId,
+            distance: Math.max(0, route.length - 1),
+          };
+        }
+        return next;
+      });
+      if (logPayload) {
+        void recordCommandLog(logPayload);
+      }
+      const destination = getLocation(target.destinationId, currentMap);
       toast.success("応援が目標に到達しました", {
         description: `${destination.name}へバス停ロボットが向かいます。`,
       });
       setActiveTab("impact");
+    };
+
+    if (userId) {
+      // ログイン時は request_reactions に +1 行を追加
+      void addRequestReact(requestId, reaction).then((ok) => {
+        if (!ok) {
+          toast.error("応援を更新できませんでした");
+          return;
+        }
+        triggerCommandIfReached();
+      });
+      return;
     }
+
+    // 未ログインは demo_state のカウンタ +1
+    updateState((cur) => addReaction(cur, requestId, reaction));
+    triggerCommandIfReached();
   };
 
   const handleRemoveRequest = (requestId: string) => {
@@ -321,6 +398,7 @@ export function BusStopRobotApp() {
   // 管理者から他プロファイルに切り替えたとき、マップ管理タブに居たらマップへ戻す
   useEffect(() => {
     if (userPresetId !== "admin" && activeTab === "maps") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveTab("map");
     }
   }, [userPresetId, activeTab]);
@@ -422,6 +500,8 @@ export function BusStopRobotApp() {
           <RequestsTab
             requests={state.requests}
             map={currentMap}
+            reactionSummaries={reactionSummaries}
+            isLoggedIn={Boolean(userId)}
             onReaction={handleReact}
             onReset={() =>
               updateState(resetDemoState(state.scenarioId, state.activeMapId))
@@ -433,12 +513,9 @@ export function BusStopRobotApp() {
 
         {activeTab === "impact" ? (
           <ImpactTab
-            currentLocation={currentLocation.name}
-            selectedLocation={selectedLocation.name}
-            activeCommand={state.activeCommand}
-            activeRequest={activeRequest}
+            map={currentMap}
+            allRequests={state.requests}
             robotStatus={state.robotStatus}
-            totalSupport={totalSupport}
           />
         ) : null}
 
@@ -446,6 +523,11 @@ export function BusStopRobotApp() {
           <ProfileTab
             selectedPresetId={userPresetId}
             onPresetChange={(presetId) => handlePresetChange(presetId, "profile")}
+            profile={profile}
+            userId={userId}
+            updateProfile={updateProfile}
+            allRequests={state.requests}
+            map={currentMap}
           />
         ) : null}
 
@@ -470,6 +552,16 @@ export function BusStopRobotApp() {
         scenario={scenario}
         selectedLocation={selectedLocation}
         selectedPreset={selectedPreset}
+        homeGrid={profile?.homeGrid ?? null}
+        homeLabel={
+          profile?.homeGrid
+            ? currentMap.features.find(
+                (f) =>
+                  f.grid.row === profile.homeGrid?.row &&
+                  f.grid.col === profile.homeGrid?.col
+              )?.shortLabel ?? "ホーム"
+            : null
+        }
         onSubmit={handleSubmit}
       />
 
@@ -576,90 +668,6 @@ function MapTab({
     </section>
   );
 }
-
-type EventDefinition = {
-  id: string;
-  category: string;
-  icon: string;
-  title: string;
-  date: string;
-  locationId: string;
-  organizer: string;
-  summary: string;
-  robot: string;
-  scheduledMove: string;
-  route: string;
-};
-
-const eventDefinitions: EventDefinition[] = [
-  {
-    id: "market-fair",
-    category: "地域",
-    icon: "🎪",
-    title: "週末まちなかマルシェ",
-    date: "土曜 11:00-16:00",
-    locationId: "market",
-    organizer: "商店街",
-    summary: "飲食店と手作り市が集まる週末イベントです。",
-    robot: "バス停ロボット A",
-    scheduledMove: "土曜 10:30 出発予定",
-    route: "みんな駅前 → 商店街マルシェ",
-  },
-  {
-    id: "company-session",
-    category: "企業",
-    icon: "🏢",
-    title: "ローカルテック社 会社説明会",
-    date: "金曜 13:00-15:00",
-    locationId: "company",
-    organizer: "ローカルテック社",
-    summary: "地元企業の採用説明会。駅からのアクセス改善が必要です。",
-    robot: "バス停ロボット B",
-    scheduledMove: "金曜 12:30 出発予定",
-    route: "みんな駅前 → ローカルテック社",
-  },
-  {
-    id: "clinic-morning",
-    category: "医療",
-    icon: "🏥",
-    title: "中央クリニック 午前診療サポート",
-    date: "明日 9:00-11:30",
-    locationId: "hospital",
-    organizer: "中央クリニック",
-    summary: "高齢者の通院時間に合わせて、病院前に停留所を寄せます。",
-    robot: "バス停ロボット A",
-    scheduledMove: "明日 8:30 出発予定",
-    route: "みんな駅前 → 中央クリニック",
-  },
-  {
-    id: "campus-meetup",
-    category: "学校",
-    icon: "🎓",
-    title: "青空キャンパス 交流イベント",
-    date: "今日 16:30-18:00",
-    locationId: "school",
-    organizer: "青空キャンパス",
-    summary: "学生イベントと地域交流会の集合場所を作ります。",
-    robot: "バス停ロボット C",
-    scheduledMove: "今日 16:00 出発予定",
-    route: "みんな駅前 → 青空キャンパス",
-  },
-  {
-    id: "shopping-day",
-    category: "地域",
-    icon: "🛒",
-    title: "買い物サポートデー",
-    date: "水曜 10:00-12:00",
-    locationId: "supermarket",
-    organizer: "まちのスーパー",
-    summary: "荷物が多い買い物帰りを支援する生活便です。",
-    robot: "バス停ロボット A",
-    scheduledMove: "水曜 9:30 出発予定",
-    route: "みんな駅前 → まちのスーパー",
-  },
-];
-
-const eventCategories = ["すべて", "地域", "企業", "医療", "学校"] as const;
 
 function EventsTab({ map }: { map: MapDefinition }) {
   const [activeCategory, setActiveCategory] =
@@ -818,6 +826,8 @@ function EventDetailsDialog({
             指令は申請タブで応援が集まったときに発行されます。
           </p>
         </section>
+
+        <CommentsSection target={{ kind: "event", id: event.id }} />
       </DialogContent>
     </Dialog>
   );
@@ -839,16 +849,21 @@ const requestFilters = [
 
 type RequestFilterId = (typeof requestFilters)[number]["id"];
 
-function isRequestAchieved(request: MoveRequest) {
+function isRequestAchievedCombined(
+  request: MoveRequest,
+  summary: RequestReactionSummary | undefined
+) {
   return (
     request.status === "adopted" ||
-    getRequestSupportTotal(request) >= REQUEST_SUPPORT_THRESHOLD
+    combinedSupportTotal(request, summary) >= REQUEST_SUPPORT_THRESHOLD
   );
 }
 
 function RequestsTab({
   requests,
   map,
+  reactionSummaries,
+  isLoggedIn,
   onReaction,
   onReset,
   isAdmin,
@@ -856,6 +871,8 @@ function RequestsTab({
 }: {
   requests: MoveRequest[];
   map: MapDefinition;
+  reactionSummaries: Record<string, RequestReactionSummary>;
+  isLoggedIn: boolean;
   onReaction: (requestId: string, reaction: ReactionKey) => void;
   onReset: () => void;
   isAdmin: boolean;
@@ -863,12 +880,17 @@ function RequestsTab({
 }) {
   const [filter, setFilter] = useState<RequestFilterId>("all");
   const [detailsRequestId, setDetailsRequestId] = useState<string | null>(null);
-  const adoptedCount = requests.filter(isRequestAchieved).length;
+  const isAchievedWithSummary = (request: MoveRequest) => {
+    if (request.status === "adopted") return true;
+    const total = combinedSupportTotal(request, reactionSummaries[request.id]);
+    return total >= REQUEST_SUPPORT_THRESHOLD;
+  };
+  const adoptedCount = requests.filter(isAchievedWithSummary).length;
   const filteredRequests = (() => {
     if (filter === "adopted") {
-      return requests.filter(isRequestAchieved);
+      return requests.filter(isAchievedWithSummary);
     }
-    const ongoing = requests.filter((request) => !isRequestAchieved(request));
+    const ongoing = requests.filter((request) => !isAchievedWithSummary(request));
     if (filter === "citizen") {
       return ongoing.filter((request) => request.requestType === "citizen");
     }
@@ -931,6 +953,8 @@ function RequestsTab({
               key={request.id}
               request={request}
               map={map}
+              summary={reactionSummaries[request.id]}
+              isLoggedIn={isLoggedIn}
               onReaction={(reaction) => onReaction(request.id, reaction)}
               onShowDetails={() => setDetailsRequestId(request.id)}
               isAdmin={isAdmin}
@@ -944,6 +968,7 @@ function RequestsTab({
       <RequestDetailsDialog
         request={detailsRequest}
         map={map}
+        summary={detailsRequest ? reactionSummaries[detailsRequest.id] : undefined}
         onOpenChange={(open) => {
           if (!open) setDetailsRequestId(null);
         }}
@@ -952,118 +977,556 @@ function RequestsTab({
   );
 }
 
-function ImpactTab({
-  currentLocation,
-  selectedLocation,
-  activeCommand,
-  activeRequest,
-  robotStatus,
-  totalSupport,
+function ProfileTab({
+  selectedPresetId,
+  onPresetChange,
+  profile,
+  userId,
+  updateProfile,
+  allRequests,
+  map,
 }: {
-  currentLocation: string;
-  selectedLocation: string;
-  activeCommand: MoveCommand | null;
-  activeRequest?: MoveRequest;
-  robotStatus: RobotStatus;
-  totalSupport: number;
+  selectedPresetId: UserPresetId;
+  onPresetChange: (presetId: UserPresetId) => void;
+  profile: Profile | null;
+  userId: string | null;
+  updateProfile: (patch: ProfileUpdate) => Promise<Profile | null>;
+  allRequests: MoveRequest[];
+  map: MapDefinition;
 }) {
-  const impact = activeCommand?.impact ?? activeRequest?.impact ?? [];
-  const beforeAfter = activeCommand?.beforeAfter ?? activeRequest?.beforeAfter ?? [];
-
   return (
     <section className="flex flex-col gap-4">
-      <section className="rounded-[1.5rem] border-4 border-[#313131] bg-[#8be7ff] p-4 shadow-[0_6px_0_#313131]">
-        <Badge className="rounded-full bg-[#ff9600] text-white">
-          統計と効果
-        </Badge>
-        <h2 className="mt-2 text-2xl font-black">
-          この移動で変わること
-        </h2>
-        <div className="mt-4 grid grid-cols-3 gap-2">
-          <ImpactMetric label="状態" value={statusLabel[robotStatus]} />
-          <ImpactMetric label="応援" value={`${totalSupport}件`} />
-          <ImpactMetric
-            label={activeRequest?.beforeAfter[0]?.label ?? "効果"}
-            value={activeRequest?.beforeAfter[0]?.after ?? "待機中"}
-          />
-        </div>
-      </section>
-
-      <CommandPanel
-        currentLocation={currentLocation}
-        selectedLocation={selectedLocation}
-        request={activeRequest}
-        robotStatus={robotStatus}
+      {userId && profile ? (
+        <>
+          <LoggedInProfileCard profile={profile} updateProfile={updateProfile} />
+          <SupportReportCard userId={userId} allRequests={allRequests} map={map} />
+          <HomeAreaCard profile={profile} updateProfile={updateProfile} map={map} />
+          {profile.role === "business" ||
+          profile.role === "organizer" ||
+          profile.role === "gov" ? (
+            <OrganizationCard userId={userId} role={profile.role} />
+          ) : null}
+          {selectedPresetId === "admin" ? (
+            <DemandHeatmapCard requests={allRequests} map={map} />
+          ) : null}
+        </>
+      ) : (
+        <LoggedOutProfileCard />
+      )}
+      <UserPresetSelector
+        selectedPresetId={selectedPresetId}
+        onChange={onPresetChange}
+        title="デモシナリオを切り替え"
       />
-
-      <section className="rounded-[1.5rem] border-4 border-[#313131] bg-[#fff2b8] p-4 shadow-[0_6px_0_#313131]">
-        <p className="text-xs font-black text-[#9c6500]">地域効果</p>
-        <h2 className="text-xl font-black">この移動で助かること</h2>
-        <div className="mt-3 grid gap-2">
-          {impact.length > 0 ? (
-            impact.map((item) => (
-              <div
-                key={item}
-                className="rounded-2xl bg-white px-3 py-2 text-sm font-black"
-              >
-                {item}
-              </div>
-            ))
-          ) : (
-            <EmptyPanel text="申請を発行すると地域効果が表示されます。" />
-          )}
-        </div>
-      </section>
-
-      <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
-        <p className="text-xs font-black text-[#58a700]">Before / After</p>
-        <h2 className="text-xl font-black">効果の見える化</h2>
-        <div className="mt-3 grid gap-2">
-          {beforeAfter.length > 0 ? (
-            beforeAfter.map((metric) => (
-              <div key={metric.label} className="rounded-2xl bg-[#f3f7f2] p-3">
-                <p className="text-xs font-black text-[#53635a]">
-                  {metric.label}
-                </p>
-                <p className="mt-1 text-lg font-black">
-                  <span className="text-[#ff4b4b]">{metric.before}</span>
-                  <span className="px-2 text-[#53635a]">→</span>
-                  <span className="text-[#58cc02]">{metric.after}</span>
-                </p>
-              </div>
-            ))
-          ) : (
-            <EmptyPanel text="指令が出ると比較指標が入ります。" />
-          )}
-        </div>
-      </section>
     </section>
   );
 }
 
-function ImpactMetric({ label, value }: { label: string; value: string }) {
+function OrganizationCard({
+  userId,
+  role,
+}: {
+  userId: string;
+  role: Profile["role"];
+}) {
+  const [org, setOrg] = useState<Organization | null>(null);
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<OrgKind>("business");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void getMyOrganization(userId).then((current) => {
+      setOrg(current);
+      if (current) {
+        setName(current.name);
+        setKind(current.kind);
+      } else {
+        // ロールに合った kind の初期値
+        setKind(role === "organizer" ? "organizer" : role === "gov" ? "gov" : "business");
+      }
+    });
+  }, [userId, role]);
+
+  const handleSave = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      toast.error("組織名を入力してください");
+      return;
+    }
+    setSaving(true);
+    const next = await upsertMyOrganization(userId, { name: trimmed, kind });
+    setSaving(false);
+    if (next) {
+      setOrg(next);
+      toast.success("組織情報を保存しました");
+    } else {
+      toast.error("保存に失敗しました");
+    }
+  };
+
+  const handleVerify = async () => {
+    if (!org) return;
+    setSaving(true);
+    const next = await selfVerifyMyOrganization(userId);
+    setSaving(false);
+    if (next) {
+      setOrg(next);
+      toast.success("公式バッジを付与しました（デモ用）");
+    }
+  };
+
   return (
-    <div className="rounded-2xl bg-white px-3 py-2">
-      <p className="truncate text-[10px] font-black text-[#58a700]">{label}</p>
-      <p className="mt-1 truncate text-sm font-black">{value}</p>
-    </div>
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
+      <Badge className="rounded-full bg-[#1cb0f6] text-white">法人プロフィール</Badge>
+      <h3 className="mt-2 text-xl font-black">組織情報</h3>
+      <p className="mt-1 text-xs font-bold text-[#53635a]">
+        企業・主催者・行政として活動する場合は組織名を登録すると、コメントや申請に組織名が表示されます。
+      </p>
+
+      <FieldGroup className="mt-3">
+        <Field>
+          <FieldLabel htmlFor="org-name">組織名</FieldLabel>
+          <Input
+            id="org-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={80}
+            placeholder="例: ローカルテック株式会社"
+            className="h-11 rounded-2xl text-base font-bold"
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="org-kind">区分</FieldLabel>
+          <select
+            id="org-kind"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as OrgKind)}
+            className="h-11 rounded-2xl border bg-background px-3 text-base font-bold"
+          >
+            <option value="business">企業</option>
+            <option value="organizer">イベント主催者</option>
+            <option value="gov">行政・運営</option>
+          </select>
+        </Field>
+      </FieldGroup>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="h-10 rounded-2xl bg-[#58cc02] px-4 text-sm font-black text-white shadow-[0_3px_0_#2f8d12]"
+        >
+          {org ? "更新" : "登録"}
+        </Button>
+        {org && !org.verified ? (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleVerify}
+            disabled={saving}
+            className="h-10 rounded-2xl text-xs font-black"
+          >
+            公式バッジを付与（デモ）
+          </Button>
+        ) : null}
+        {org?.verified ? (
+          <Badge className="rounded-full bg-[#3a7d00] text-white">
+            ✓ 公式
+          </Badge>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
-function ProfileTab({
-  selectedPresetId,
-  onPresetChange,
+function DemandHeatmapCard({
+  requests,
+  map,
 }: {
-  selectedPresetId: UserPresetId;
-  onPresetChange: (presetId: UserPresetId) => void;
+  requests: MoveRequest[];
+  map: MapDefinition;
 }) {
+  // destinationId ごとの申請件数を集計
+  const counts = new Map<string, number>();
+  for (const r of requests) {
+    counts.set(r.destinationId, (counts.get(r.destinationId) ?? 0) + 1);
+  }
+  const max = Math.max(1, ...Array.from(counts.values()));
+
   return (
-    <section className="flex flex-col gap-4">
-      <UserPresetSelector
-        selectedPresetId={selectedPresetId}
-        onChange={onPresetChange}
-        title="プロフィールを変更"
-      />
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
+      <Badge className="rounded-full bg-[#ff4b4b] text-white">行政向け</Badge>
+      <h3 className="mt-2 text-xl font-black">需要ヒートマップ</h3>
+      <p className="mt-1 text-xs font-bold text-[#53635a]">
+        申請が集中している場所ほど濃く表示されます。恒久バス停の増設候補が見えます。
+      </p>
+
+      <div
+        className="mt-3 grid overflow-hidden rounded-xl border-2 border-[#313131]"
+        style={{
+          gridTemplateColumns: `repeat(${map.cols}, minmax(0, 1fr))`,
+          gridTemplateRows: `repeat(${map.rows}, minmax(0, 1fr))`,
+          aspectRatio: `${map.cols} / ${map.rows}`,
+        }}
+      >
+        {Array.from({ length: map.rows }).flatMap((_, rowIndex) =>
+          Array.from({ length: map.cols }).map((_, colIndex) => {
+            const feature = map.features.find(
+              (f) => f.grid.row === rowIndex && f.grid.col === colIndex
+            );
+            const count = feature ? counts.get(feature.id) ?? 0 : 0;
+            const intensity = count > 0 ? count / max : 0;
+            const heatColor =
+              count > 0
+                ? `rgba(255, 75, 75, ${0.25 + intensity * 0.7})`
+                : feature
+                ? "rgba(28,176,246,0.18)"
+                : "transparent";
+            return (
+              <div
+                key={`${rowIndex}-${colIndex}`}
+                className="relative grid place-items-center"
+                style={{ backgroundColor: heatColor }}
+                title={feature ? `${feature.label}: ${count}件` : ""}
+              >
+                {feature ? (
+                  <span className="text-xs leading-none">{feature.icon}</span>
+                ) : null}
+                {count > 0 ? (
+                  <span className="absolute right-0 top-0 rounded-bl-md bg-white/90 px-1 text-[8px] font-black text-[#25302b]">
+                    {count}
+                  </span>
+                ) : null}
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-col gap-1 text-xs font-bold text-[#53635a]">
+        {Array.from(counts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([id, c]) => {
+            const feature = map.features.find((f) => f.id === id);
+            return (
+              <div
+                key={id}
+                className="flex items-center justify-between rounded-xl bg-[#f3f7f2] px-3 py-1.5"
+              >
+                <span>
+                  {feature?.icon} {feature?.label ?? id}
+                </span>
+                <span className="font-black text-[#ff4b4b]">{c}件</span>
+              </div>
+            );
+          })}
+      </div>
+    </section>
+  );
+}
+
+function SupportReportCard({
+  userId,
+  allRequests,
+  map,
+}: {
+  userId: string;
+  allRequests: MoveRequest[];
+  map: MapDefinition;
+}) {
+  const { ids } = useMyReactedRequestIds(userId);
+  const reactedSet = new Set(ids);
+  const reactedRequests = allRequests.filter((r) => reactedSet.has(r.id));
+  const adoptedCount = reactedRequests.filter((r) => r.status === "adopted").length;
+
+  return (
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-[#e8ffd9] p-4 shadow-[0_6px_0_#313131]">
+      <Badge className="rounded-full bg-[#3a7d00] text-white">
+        あなたの応援が動かした
+      </Badge>
+      <h3 className="mt-2 text-xl font-black">応援レポート</h3>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="rounded-2xl bg-white p-3">
+          <p className="text-xs font-black text-[#58a700]">応援した申請</p>
+          <p className="mt-1 text-2xl font-black">{reactedRequests.length}</p>
+        </div>
+        <div className="rounded-2xl bg-white p-3">
+          <p className="text-xs font-black text-[#3a7d00]">うち採択</p>
+          <p className="mt-1 text-2xl font-black text-[#58cc02]">
+            {adoptedCount}
+          </p>
+        </div>
+      </div>
+      <ul className="mt-3 flex flex-col gap-1.5">
+        {reactedRequests.length === 0 ? (
+          <li className="rounded-2xl bg-white px-3 py-2 text-xs font-bold text-[#53635a]">
+            まだ応援した申請がありません。気になる申請を「応援する」で支えてみよう。
+          </li>
+        ) : (
+          reactedRequests.slice(0, 5).map((r) => {
+            const dest = getLocation(r.destinationId, map);
+            return (
+              <li
+                key={r.id}
+                className="flex items-center justify-between gap-2 rounded-2xl bg-white px-3 py-2"
+              >
+                <span className="truncate text-xs font-black">
+                  {dest.icon} {r.title}
+                </span>
+                <Badge
+                  className={
+                    r.status === "adopted"
+                      ? "shrink-0 bg-[#58cc02] text-white"
+                      : "shrink-0 bg-[#1cb0f6] text-white"
+                  }
+                >
+                  {r.status === "adopted" ? "採択" : "候補"}
+                </Badge>
+              </li>
+            );
+          })
+        )}
+      </ul>
+    </section>
+  );
+}
+
+function HomeAreaCard({
+  profile,
+  updateProfile,
+  map,
+}: {
+  profile: Profile;
+  updateProfile: (patch: ProfileUpdate) => Promise<Profile | null>;
+  map: MapDefinition;
+}) {
+  const [saving, setSaving] = useState(false);
+  const homeFeature = profile.homeGrid
+    ? map.features.find(
+        (f) =>
+          f.grid.row === profile.homeGrid?.row &&
+          f.grid.col === profile.homeGrid?.col
+      ) ?? null
+    : null;
+
+  const handleSelect = async (locationId: string) => {
+    const feature = map.features.find((f) => f.id === locationId);
+    if (!feature) return;
+    setSaving(true);
+    const updated = await updateProfile({ homeGrid: feature.grid });
+    setSaving(false);
+    if (updated)
+      toast.success(`ホームを「${feature.shortLabel}」に設定しました`);
+    else toast.error("ホーム設定に失敗しました");
+  };
+
+  const handleClear = async () => {
+    setSaving(true);
+    const updated = await updateProfile({ homeGrid: null });
+    setSaving(false);
+    if (updated) toast.success("ホームをクリアしました");
+  };
+
+  return (
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
+      <Badge className="rounded-full bg-[#1cb0f6] text-white">
+        あなたのホーム
+      </Badge>
+      <h3 className="mt-2 text-xl font-black">出発地を登録</h3>
+      <p className="mt-1 text-xs font-bold text-[#53635a]">
+        登録しておくと、申請の効果欄に「ホームから○分」の改善が自動表示されます。
+      </p>
+
+      <div className="mt-3 rounded-2xl bg-[#f3f7f2] p-3">
+        <p className="text-xs font-black text-[#53635a]">現在のホーム</p>
+        <p className="mt-1 text-base font-black">
+          {homeFeature
+            ? `${homeFeature.icon} ${homeFeature.label}`
+            : "未設定"}
+        </p>
+        {homeFeature ? (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleClear}
+            disabled={saving}
+            className="mt-2 h-9 rounded-xl text-xs font-black"
+          >
+            クリア
+          </Button>
+        ) : null}
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {map.features.map((feature) => {
+          const active =
+            profile.homeGrid?.row === feature.grid.row &&
+            profile.homeGrid?.col === feature.grid.col;
+          return (
+            <button
+              key={feature.id}
+              type="button"
+              onClick={() => handleSelect(feature.id)}
+              disabled={saving}
+              className={`flex flex-col items-center gap-0.5 rounded-2xl border-[3px] p-2 text-xs font-black transition ${
+                active
+                  ? "border-[#313131] bg-[#1cb0f6] text-white shadow-[0_4px_0_#0b82bd]"
+                  : "border-[#d8e0dc] bg-white text-[#53635a]"
+              }`}
+            >
+              <span className="text-xl leading-none">{feature.icon}</span>
+              {feature.shortLabel}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function LoggedInProfileCard({
+  profile,
+  updateProfile,
+}: {
+  profile: Profile;
+  updateProfile: (patch: ProfileUpdate) => Promise<Profile | null>;
+}) {
+  const [name, setName] = useState(profile.displayName);
+  const [savingName, setSavingName] = useState(false);
+  const [savingRole, setSavingRole] = useState(false);
+  const initials = (profile.displayName || "?").slice(0, 1).toUpperCase();
+
+  useEffect(() => {
+    // profile が変わったときに編集中の name をリセット
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setName(profile.displayName);
+  }, [profile.displayName]);
+
+  const handleNameSave = async () => {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === profile.displayName) return;
+    setSavingName(true);
+    const updated = await updateProfile({ displayName: trimmed });
+    setSavingName(false);
+    if (updated) toast.success("表示名を保存しました");
+    else toast.error("保存に失敗しました");
+  };
+
+  const handleRoleChange = async (role: Profile["role"]) => {
+    if (role === profile.role) return;
+    setSavingRole(true);
+    const updated = await updateProfile({ role });
+    setSavingRole(false);
+    if (updated)
+      toast.success(`ロールを「${ROLE_META[role].label}」に切り替えました`);
+    else toast.error("ロール変更に失敗しました");
+  };
+
+  return (
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
+      <div className="flex items-center gap-3">
+        <Avatar className="size-14 border-2 border-[#313131]">
+          {profile.avatarUrl ? (
+            <AvatarImage src={profile.avatarUrl} alt={profile.displayName} />
+          ) : null}
+          <AvatarFallback className="bg-[#1cb0f6] text-lg font-black text-white">
+            {initials}
+          </AvatarFallback>
+        </Avatar>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-black text-[#58a700]">
+            ログイン中のアカウント
+          </p>
+          <h3 className="truncate text-lg font-black">{profile.displayName}</h3>
+          <Badge className="mt-1 rounded-full bg-[#ff9600] text-white">
+            {ROLE_META[profile.role].emoji} {ROLE_META[profile.role].label}
+          </Badge>
+        </div>
+        <form action={signOut}>
+          <Button
+            type="submit"
+            variant="outline"
+            className="h-9 rounded-xl text-xs font-black"
+          >
+            ログアウト
+          </Button>
+        </form>
+      </div>
+
+      <FieldGroup className="mt-4">
+        <Field>
+          <FieldLabel htmlFor="profile-display-name">表示名</FieldLabel>
+          <div className="flex items-center gap-2">
+            <Input
+              id="profile-display-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={40}
+              className="h-11 rounded-2xl text-base font-bold"
+            />
+            <Button
+              type="button"
+              onClick={handleNameSave}
+              disabled={savingName || !name.trim() || name === profile.displayName}
+              className="h-11 rounded-xl bg-[#58cc02] px-3 text-xs font-black text-white shadow-[0_3px_0_#2f8d12]"
+            >
+              保存
+            </Button>
+          </div>
+          <FieldDescription>
+            申請やコメントに表示される名前です。
+          </FieldDescription>
+        </Field>
+
+        <Field>
+          <FieldLabel>あなたのロール</FieldLabel>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {ALL_ROLES.map((role) => {
+              const meta = ROLE_META[role];
+              const active = profile.role === role;
+              return (
+                <button
+                  key={role}
+                  type="button"
+                  onClick={() => handleRoleChange(role)}
+                  disabled={savingRole}
+                  className={`flex flex-col items-center gap-0.5 rounded-2xl border-[3px] p-2 text-xs font-black transition ${
+                    active
+                      ? "border-[#313131] bg-[#58cc02] text-white shadow-[0_4px_0_#2f8d12]"
+                      : "border-[#d8e0dc] bg-white text-[#53635a]"
+                  }`}
+                >
+                  <span className="text-xl leading-none">{meta.emoji}</span>
+                  {meta.label}
+                </button>
+              );
+            })}
+          </div>
+          <FieldDescription>
+            選んだロールはコメント投稿時にバッジで表示されます。
+          </FieldDescription>
+        </Field>
+      </FieldGroup>
+    </section>
+  );
+}
+
+function LoggedOutProfileCard() {
+  return (
+    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-[#fff8d8] p-4 shadow-[0_6px_0_#313131]">
+      <Badge className="rounded-full bg-[#ff9600] text-white">未ログイン</Badge>
+      <h3 className="mt-2 text-xl font-black">アカウントで全機能を使う</h3>
+      <p className="mt-1 text-xs font-bold text-[#53635a]">
+        ログインすると、コメント投稿・1人1票の応援・あなたが動かしたバス停のレポートが見られます。
+      </p>
+      <Button
+        asChild
+        className="mt-3 h-12 w-full rounded-2xl bg-[#1cb0f6] text-base font-black text-white shadow-[0_4px_0_#0b82bd]"
+      >
+        <Link href="/login">ログインまたはサインアップ</Link>
+      </Button>
     </section>
   );
 }
@@ -1102,65 +1565,115 @@ function DemoMap({
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-[#eef9fb] px-2 py-2">
       <div className="relative min-h-0 flex-1">
-        <div
-          className="absolute inset-0 grid overflow-hidden rounded-xl bg-[#78c95e] shadow-[inset_0_0_22px_rgba(38,93,42,0.28)]"
-          style={{
-            gridTemplateColumns: `repeat(${map.cols}, minmax(0, 1fr))`,
-            gridTemplateRows: `repeat(${map.rows}, minmax(0, 1fr))`,
-          }}
-        >
-          {map.grid.flatMap((row, rowIndex) =>
-            [...row].map((_, colIndex) => {
-              const point: GridPoint = { row: rowIndex, col: colIndex };
-              const key = gridKey(point);
-              const kind = getTileKind(point, map.grid);
-              const location = locationByGrid.get(key);
-              const isRoute = routeKeys.has(key);
-              const isCurrentRoad = key === currentAccessKey;
-              const isTargetRoad = key === targetAccessKey;
-              const roadDirections = isRoadKind(kind)
-                ? getRoadDirections(point, map.grid)
-                : null;
-              const routeDirections = isRoute
-                ? getRouteDirections(point, routeKeys)
-                : null;
-
-              return (
-                <div
-                  key={key}
-                  className={cn(
-                    "relative min-h-0 overflow-hidden",
-                    tileClass(kind)
-                  )}
+        <div className="absolute inset-0 overflow-hidden rounded-xl">
+          <TransformWrapper
+            minScale={1}
+            maxScale={4}
+            initialScale={1}
+            centerZoomedOut
+            limitToBounds
+            doubleClick={{ mode: "zoomIn", step: 0.5 }}
+            wheel={{ step: 0.15 }}
+            pinch={{ step: 5 }}
+          >
+            {({ zoomIn, zoomOut, resetTransform }) => (
+              <>
+                <TransformComponent
+                  wrapperStyle={{ width: "100%", height: "100%" }}
+                  contentStyle={{ width: "100%", height: "100%" }}
                 >
-                  <TileSurface
-                    kind={kind}
-                    roadDirections={roadDirections}
-                    routeDirections={routeDirections}
-                  />
-                  {isCurrentRoad ? (
-                    <span className="absolute inset-1 z-10 grid place-items-center rounded-full bg-white text-[#1cb0f6] ring-2 ring-[#1cb0f6]">
-                      <BusIcon className="size-5" />
-                    </span>
-                  ) : null}
-                  {isTargetRoad && !isCurrentRoad ? (
-                    <span className="absolute inset-1 z-10 rounded-full border-[3px] border-[#ff4b4b]" />
-                  ) : null}
-                  {!location ? <MapChip kind={kind} /> : null}
-                  {location ? (
-                    <LocationTileButton
-                      locationId={location.id}
-                      map={map}
-                      isCurrent={location.id === currentLocationId}
-                      isSelected={location.id === selectedDestinationId}
-                      isAdopted={location.id === adoptedRequest?.destinationId}
-                      onSelect={onSelect}
-                    />
-                  ) : null}
+                  <div
+                    className="grid h-full w-full overflow-hidden bg-[#78c95e] shadow-[inset_0_0_22px_rgba(38,93,42,0.28)]"
+                    style={{
+                      gridTemplateColumns: `repeat(${map.cols}, minmax(0, 1fr))`,
+                      gridTemplateRows: `repeat(${map.rows}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {map.grid.flatMap((row, rowIndex) =>
+                      [...row].map((_, colIndex) => {
+                        const point: GridPoint = { row: rowIndex, col: colIndex };
+                        const key = gridKey(point);
+                        const kind = getTileKind(point, map.grid);
+                        const location = locationByGrid.get(key);
+                        const isRoute = routeKeys.has(key);
+                        const isCurrentRoad = key === currentAccessKey;
+                        const isTargetRoad = key === targetAccessKey;
+                        const roadDirections = isRoadKind(kind)
+                          ? getRoadDirections(point, map.grid)
+                          : null;
+                        const routeDirections = isRoute
+                          ? getRouteDirections(point, routeKeys)
+                          : null;
+
+                        return (
+                          <div
+                            key={key}
+                            className={cn(
+                              "relative min-h-0 overflow-hidden",
+                              tileClass(kind)
+                            )}
+                          >
+                            <TileSurface
+                              kind={kind}
+                              roadDirections={roadDirections}
+                              routeDirections={routeDirections}
+                            />
+                            {isCurrentRoad ? (
+                              <span className="absolute inset-1 z-10 grid place-items-center rounded-full bg-white text-[#1cb0f6] ring-2 ring-[#1cb0f6]">
+                                <BusIcon className="size-5" />
+                              </span>
+                            ) : null}
+                            {isTargetRoad && !isCurrentRoad ? (
+                              <span className="absolute inset-1 z-10 rounded-full border-[3px] border-[#ff4b4b]" />
+                            ) : null}
+                            {!location ? <MapChip kind={kind} /> : null}
+                            {location ? (
+                              <LocationTileButton
+                                locationId={location.id}
+                                map={map}
+                                isCurrent={location.id === currentLocationId}
+                                isSelected={location.id === selectedDestinationId}
+                                isAdopted={location.id === adoptedRequest?.destinationId}
+                                onSelect={onSelect}
+                              />
+                            ) : null}
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </TransformComponent>
+
+                {/* ズームコントロール (右上に重ねる) */}
+                <div className="absolute right-2 top-2 z-30 flex flex-col gap-1">
+                  <button
+                    type="button"
+                    aria-label="拡大"
+                    onClick={() => zoomIn()}
+                    className="grid size-9 place-items-center rounded-full border-2 border-[#313131] bg-white text-[#313131] shadow-[0_3px_0_#313131] active:translate-y-[1px]"
+                  >
+                    <ZoomInIcon className="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="縮小"
+                    onClick={() => zoomOut()}
+                    className="grid size-9 place-items-center rounded-full border-2 border-[#313131] bg-white text-[#313131] shadow-[0_3px_0_#313131] active:translate-y-[1px]"
+                  >
+                    <ZoomOutIcon className="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="リセット"
+                    onClick={() => resetTransform()}
+                    className="grid size-9 place-items-center rounded-full border-2 border-[#313131] bg-white text-[#313131] shadow-[0_3px_0_#313131] active:translate-y-[1px]"
+                  >
+                    <RotateCcwIcon className="size-4" />
+                  </button>
                 </div>
-              );
-            })
-          )}
+              </>
+            )}
+          </TransformWrapper>
         </div>
         <div className="absolute inset-x-3 bottom-3 z-30">
           <Button
@@ -1379,39 +1892,6 @@ function LocationTileButton({
   );
 }
 
-function CommandPanel({
-  currentLocation,
-  selectedLocation,
-  request,
-  robotStatus,
-}: {
-  currentLocation: string;
-  selectedLocation: string;
-  request?: MoveRequest;
-  robotStatus: RobotStatus;
-}) {
-  return (
-    <section className="rounded-[1.5rem] border-4 border-[#313131] bg-white p-4 shadow-[0_6px_0_#313131]">
-      <div className="flex items-center gap-3">
-        <div className="grid size-12 place-items-center rounded-2xl bg-[#ff4b4b] text-white shadow-[0_4px_0_#c73434]">
-          <MegaphoneIcon />
-        </div>
-        <div>
-          <p className="text-xs font-black text-[#ff4b4b]">指令パネル</p>
-          <h2 className="text-xl font-black">{statusLabel[robotStatus]}</h2>
-        </div>
-      </div>
-
-      <div className="mt-4 grid gap-3">
-        <RouteRow label="出発" value={currentLocation} />
-        <RouteRow label="到着" value={selectedLocation} />
-        <RouteRow label="理由" value={request?.reason ?? "申請を選んでください"} />
-        <RouteRow label="対象" value={request?.audience ?? "地域の利用者"} />
-      </div>
-    </section>
-  );
-}
-
 function RouteRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-2xl bg-[#f3f7f2] px-3 py-2">
@@ -1424,10 +1904,12 @@ function RouteRow({ label, value }: { label: string; value: string }) {
 function RequestDetailsDialog({
   request,
   map,
+  summary,
   onOpenChange,
 }: {
   request: MoveRequest | null;
   map: MapDefinition;
+  summary: RequestReactionSummary | undefined;
   onOpenChange: (open: boolean) => void;
 }) {
   const open = request !== null;
@@ -1440,7 +1922,8 @@ function RequestDetailsDialog({
     request.requestType === "business"
       ? "企業"
       : requesterLabelByScenario[request.scenarioId];
-  const achieved = isRequestAchieved(request);
+  const achieved = isRequestAchievedCombined(request, summary);
+  const supporterCount = summary?.supporterIds.size ?? 0;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1479,7 +1962,15 @@ function RequestDetailsDialog({
           <RouteRow label="希望日時" value={request.desiredTime} />
           <RouteRow label="申請理由" value={request.reason} />
           <RouteRow label="対象者" value={request.audience} />
+          {supporterCount > 0 ? (
+            <RouteRow
+              label="アカウント応援者"
+              value={`${supporterCount}人`}
+            />
+          ) : null}
         </div>
+
+        <CommentsSection target={{ kind: "request", id: request.id }} />
 
         {request.impact.length > 0 && (
           <section className="rounded-[1.25rem] border-[3px] border-[#313131] bg-[#fff8d8] p-3">
@@ -1536,6 +2027,8 @@ function RequestDetailsDialog({
 function RequestCard({
   request,
   map,
+  summary,
+  isLoggedIn,
   onReaction,
   onShowDetails,
   isAdmin,
@@ -1543,13 +2036,15 @@ function RequestCard({
 }: {
   request: MoveRequest;
   map: MapDefinition;
+  summary: RequestReactionSummary | undefined;
+  isLoggedIn: boolean;
   onReaction: (reaction: ReactionKey) => void;
   onShowDetails: () => void;
   isAdmin: boolean;
   onRemove: () => void;
 }) {
   const destination = getLocation(request.destinationId, map);
-  const total = getRequestSupportTotal(request);
+  const total = combinedSupportTotal(request, summary);
   const reached = total >= REQUEST_SUPPORT_THRESHOLD;
   const achieved = reached || request.status === "adopted";
   const ratio = Math.min(
@@ -1561,6 +2056,9 @@ function RequestCard({
     request.requestType === "business"
       ? "企業"
       : requesterLabelByScenario[request.scenarioId];
+  const supporterCount = summary ? summary.supporterIds.size : 0;
+  const myCount = summary?.myCount ?? 0;
+  const hasMyReaction = isLoggedIn && myCount > 0;
 
   return (
     <article className="rounded-[1.25rem] border-[3px] border-[#313131] bg-[#f9fbf7] p-3">
@@ -1621,6 +2119,13 @@ function RequestCard({
             ? "応援が目標に到達し、ロボットへ指令が出ました。"
             : `あと${remaining}件の応援で指令が出ます。`}
         </p>
+        {supporterCount > 0 ? (
+          <p className="text-xs font-bold text-[#3a7d00]">
+            {hasMyReaction ? "あなたを含む" : ""}
+            {supporterCount}人がアカウントから応援
+            {hasMyReaction ? `（あなた:${myCount}回）` : ""}
+          </p>
+        ) : null}
       </div>
 
       <div className="mt-3 grid grid-cols-2 gap-2">
@@ -1638,8 +2143,8 @@ function RequestCard({
           disabled={reached}
           className="h-12 rounded-2xl border-2 border-[#313131] bg-[#58cc02] px-3 text-sm font-black text-white shadow-[0_3px_0_#313131] transition active:translate-y-0.5 active:shadow-none disabled:opacity-60 disabled:active:translate-y-0 disabled:active:shadow-[0_3px_0_#313131]"
         >
-          応援する
-          <span className="ml-2 text-xs">+1</span>
+          {reached ? "達成済み ✓" : "応援する"}
+          {!reached ? <span className="ml-2 text-xs">+1</span> : null}
         </button>
       </div>
     </article>
@@ -1726,6 +2231,8 @@ function RequestDialog({
   scenario,
   selectedLocation,
   selectedPreset,
+  homeGrid,
+  homeLabel,
   onSubmit,
 }: {
   open: boolean;
@@ -1734,9 +2241,18 @@ function RequestDialog({
   scenario: ReturnType<typeof getScenario>;
   selectedLocation: ReturnType<typeof getLocation>;
   selectedPreset: UserPreset;
+  homeGrid: GridPoint | null;
+  homeLabel: string | null;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   const isBusiness = requestType === "business";
+  const homeImpact = homeGrid
+    ? estimateHomeImpact(
+        homeGrid,
+        selectedLocation.grid,
+        selectedLocation.roadAccess
+      )
+    : null;
   const defaultReason = optionOrFirst(
     scenario.reasonOptions,
     selectedPreset.defaultReason
@@ -1745,9 +2261,9 @@ function RequestDialog({
     scenario.audienceOptions,
     selectedPreset.defaultAudience
   );
-  const defaultTitle = isBusiness
-    ? `${selectedLocation.name}でイベント参加者を呼びたい`
-    : `${selectedLocation.name}に来てほしい`;
+  const titlePlaceholder = isBusiness
+    ? "例: ローカルテック社前で説明会の参加者を呼びたい"
+    : "例: 学生街にイベント前に来てほしい";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1765,20 +2281,48 @@ function RequestDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {homeImpact ? (
+          <section className="rounded-[1.25rem] border-[3px] border-[#3a7d00] bg-[#e8ffd9] p-3">
+            <Badge className="rounded-full bg-[#3a7d00] text-white">
+              あなたのホームから
+            </Badge>
+            <p className="mt-2 text-sm font-black">
+              {homeLabel ?? "ホーム"} → {selectedLocation.shortName}
+            </p>
+            <div className="mt-2 grid grid-cols-3 gap-2 text-center text-xs font-black">
+              <div className="rounded-xl bg-white p-2">
+                <p className="text-[10px] text-[#53635a]">現状徒歩</p>
+                <p className="text-base text-[#ff4b4b]">{homeImpact.before}分</p>
+              </div>
+              <div className="rounded-xl bg-white p-2">
+                <p className="text-[10px] text-[#53635a]">ロボット移動後</p>
+                <p className="text-base text-[#3a7d00]">{homeImpact.after}分</p>
+              </div>
+              <div className="rounded-xl bg-white p-2">
+                <p className="text-[10px] text-[#53635a]">短縮</p>
+                <p className="text-base text-[#58cc02]">-{homeImpact.saved}分</p>
+              </div>
+            </div>
+          </section>
+        ) : null}
+
         <form onSubmit={onSubmit} className="flex flex-col gap-5">
           <input type="hidden" name="destinationId" value={selectedLocation.id} />
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="title">行き先</FieldLabel>
+              <FieldLabel htmlFor="title">タイトル</FieldLabel>
               <Input
                 id="title"
                 name="title"
-                defaultValue={defaultTitle}
+                placeholder={titlePlaceholder}
                 className="h-12 rounded-2xl text-base font-bold"
                 required
               />
               <FieldDescription>
-                地図で選んだ場所: {selectedLocation.description}
+                地図で選んだ場所: {selectedLocation.name}
+                {selectedLocation.description
+                  ? ` — ${selectedLocation.description}`
+                  : ""}
               </FieldDescription>
             </Field>
 
@@ -1834,35 +2378,23 @@ function RequestDialog({
               </Field>
               <Field>
                 <FieldLabel htmlFor="audience">誰のため？</FieldLabel>
-                <select
+                <Input
                   id="audience"
                   name="audience"
-                  defaultValue={defaultAudience}
-                  className="h-12 rounded-2xl border bg-background px-3 text-base font-bold"
-                >
-                  {scenario.audienceOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
+                  placeholder={defaultAudience}
+                  className="h-12 rounded-2xl text-base font-bold"
+                />
               </Field>
             </div>
 
             <Field>
               <FieldLabel htmlFor="reason">理由</FieldLabel>
-              <select
+              <Input
                 id="reason"
                 name="reason"
-                defaultValue={defaultReason}
-                className="h-12 rounded-2xl border bg-background px-3 text-base font-bold"
-              >
-                {scenario.reasonOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
+                placeholder={defaultReason}
+                className="h-12 rounded-2xl text-base font-bold"
+              />
             </Field>
 
             <Field>

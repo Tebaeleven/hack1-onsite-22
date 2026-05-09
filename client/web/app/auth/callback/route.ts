@@ -6,9 +6,9 @@ export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get("code");
   // open redirect 防止: 自サイト内のパス (/foo) のみ許可。// や http:// で始まる値は弾く
-  const rawNext = searchParams.get("next") ?? "/demo";
+  const rawNext = searchParams.get("next") ?? "/";
   const next =
-    rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/demo";
+    rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
 
   if (code) {
     const supabase = await createClient();

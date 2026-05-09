@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
   ArrowLeftIcon,
   BotIcon,
@@ -36,6 +37,7 @@ type ThreeRefs = {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
+  controls: OrbitControls;
   robot: THREE.Group;
   wheels: THREE.Mesh[];
   targetMarker: THREE.Group;
@@ -122,6 +124,17 @@ export function VoxelRobotDemo() {
     renderer.shadowMap.type = THREE.PCFShadowMap;
     host.appendChild(renderer.domElement);
 
+    // OrbitControls: マウス/トラックパッド/タッチで視点操作 (一本指=回転, 二本指=パン+ピンチズーム)
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = false;
+    controls.minDistance = 8;
+    controls.maxDistance = 40;
+    controls.maxPolarAngle = Math.PI / 2 - 0.05;
+    controls.target.set(0, 0.5, 0);
+    controls.update();
+
     const hemi = new THREE.HemisphereLight("#ffffff", "#58cc02", 1.8);
     scene.add(hemi);
 
@@ -157,6 +170,7 @@ export function VoxelRobotDemo() {
       renderer,
       scene,
       camera,
+      controls,
       robot,
       wheels: robot.userData.wheels as THREE.Mesh[],
       targetMarker,
@@ -206,7 +220,8 @@ export function VoxelRobotDemo() {
 
       active.targetMarker.rotation.y += 0.02;
       active.targetMarker.position.y = 0.12 + Math.sin(Date.now() * 0.004) * 0.05;
-      active.camera.lookAt(active.robot.position.x * 0.25, 0.8, active.robot.position.z * 0.25);
+      // OrbitControls がカメラ姿勢を管理 (ユーザー操作優先)
+      active.controls.update();
       active.renderer.render(active.scene, active.camera);
       active.frameId = requestAnimationFrame(animate);
     };
@@ -220,6 +235,7 @@ export function VoxelRobotDemo() {
       if (!refs.current) return;
       refs.current.disposed = true;
       cancelAnimationFrame(refs.current.frameId);
+      refs.current.controls.dispose();
       disposeScene(refs.current.scene);
       refs.current.renderer.dispose();
       refs.current.renderer.domElement.remove();

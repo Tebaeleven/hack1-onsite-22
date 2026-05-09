@@ -119,10 +119,11 @@ export function createMoveRequest(
     audience: input.audience,
     note: input.note,
     status: "candidate",
+    // 初期応援数は 0 から始める。応援ボタン or DB 側の積算で 10 に到達させる
     reactions: {
-      wantToGo: isBusiness ? 8 : 3,
-      helpful: isBusiness ? 5 : 4,
-      cheer: input.sponsored ? 14 : 6,
+      wantToGo: 0,
+      helpful: 0,
+      cheer: 0,
     },
     impact: isBusiness
       ? [
